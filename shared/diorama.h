@@ -6,19 +6,26 @@
 // original frame; moving or using two eyes reveals the depth.
 #pragma once
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <chrono>
 #include <vector>
 
 namespace diorama {
+
+inline double nowMs() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
 static const int TEX_W = 512, TEX_H = 480, SLICES = 6;  // slices 0-3 BG1-4, 4 sprites, 5 backdrop
 static const float M7_FAR = 7.0f;
 
 struct Quad {
     float u0, u1, v;     // texel columns [u0, u1), row v
-    float disparity;     // SNES pixels, + = behind the screen
+    float disparity;     // SNES pixels, + = behind the screen (top edge)
     float slice, z;      // texture slice and the priority depth this sheet shows
+    float disparity1;    // bottom edge (differs on a sloping Mode 7 floor)
+    bool m7 = false;     // sample the HD Mode 7 map instead of the sheet colour
+    float m7uv[4][2];    // map texel coords at top-left, top-right, bottom-left, bottom-right
 };
 
 struct Input {
@@ -28,7 +35,30 @@ struct Input {
     const uint8_t *zmain;          // priority depth of the owner pixel
     const uint16_t *planeColor[5]; // each layer alone, w x h tightly packed
     const uint8_t *planeZ[5];      // 0 = empty
+    // optional Mode 7 state (snes3d_get_mode7): per-scanline matrices, VRAM, CGRAM, flags
+    const int16_t *m7lines = nullptr;
+    const uint8_t *vram = nullptr;
+    const uint16_t *cgram = nullptr;
+    int m7flags = 0;
+    double profMs[5] = {0, 0, 0, 0, 0};  // slices, spans, map, look, sort (last build)
 };
+
+// The SNES Mode 7 transform with the matrix of scanline `line`, at continuous screen position
+// (xc, yc) in scanline units (pixel x of scanline L covers [x, x+1) x [L, L+1)). Returns 1024x1024
+// map texel coordinates, before wrapping.
+inline void mode7uv(const int16_t *L, int flags, int line, float xc, float yc, float &u, float &v) {
+    auto sx13 = [](int a) { return ((int32_t)a << 19) >> 19; };
+    auto clip10 = [](int a) { return (a & 0x2000) ? (a | ~0x3ff) : (a & 0x3ff); };
+    const int16_t *m = L + 8 * line;
+    int A = m[0], B = m[1], C = m[2], D = m[3];
+    int CX = sx13(m[4]), CY = sx13(m[5]), HO = sx13(m[6]), VO = sx13(m[7]);
+    float xs = (flags & 1) ? 255.5f - xc : xc - 0.5f;
+    float yp = yc + 0.5f;  // scanline L samples y' = L + 1 at its centre (yc = L + 0.5)
+    if (flags & 2) yp = 255.0f - yp;
+    int xx = clip10(HO - CX), yy = clip10(VO - CY);
+    u = (A * xs + (float)A * xx + B * yp + (float)B * yy) / 256.0f + CX;
+    v = (C * xs + (float)C * xx + D * yp + (float)D * yy) / 256.0f + CY;
+}
 
 // Priority depth (z - 32) to disparity. Sheets must get strictly nearer as SNES priority rises,
 // otherwise a sprite could float in front of a tile that covers it. Modes 0/1 and 2-7 interleave
@@ -56,6 +86,12 @@ struct Builder {
     bool mode7Ramp = true;
     bool showBackdrop = true;   // false: no backdrop sheet, so the room shows through behind the game
     Look look;
+    // HD Mode 7: the whole 1024x1024 map as RGBA (alpha 0 = colour 0, transparent); rebuilt on change
+    std::vector<uint32_t> map7;
+    bool map7Dirty = false, frameHasM7 = false;
+    uint64_t map7Hash = 0;
+    int m7flags = 0;
+    double profMs[5] = {0, 0, 0, 0, 0};  // slices, spans, map, look, sort (last build)
     uint32_t lut[65536];
 
     Builder() : tex((size_t)SLICES * TEX_H * TEX_W, 0) {
@@ -66,8 +102,11 @@ struct Builder {
     }
     uint32_t *slice(int s) { return &tex[(size_t)s * TEX_H * TEX_W]; }
 
+    unsigned lastW = 256, lastH = 224;  // frame size of the last build
+
     void build(const Input &in) {
         const unsigned w = std::min<unsigned>(in.w, TEX_W), h = std::min<unsigned>(in.h, TEX_H);
+        lastW = w; lastH = h;
         quads.clear();
 
         // which mode family is on screen (BG3 only exists in modes 0/1; BG1 low priority is 11 there, 7 in modes 2+)
@@ -86,6 +125,7 @@ struct Builder {
                 if (in.layer[y * w + x] == 6) { m7row[y] = 1; if (m7top < 0) m7top = (int)y; break; }
         if (!mode7Ramp) m7top = -1;
 
+        double t0 = nowMs();
         // layer slices: the composited colour where this layer owns the pixel (keeps transparency and
         // colour-math effects), its own colour where it is hidden, empty elsewhere
         for (int n = 0; n < 5; n++) {
@@ -116,56 +156,141 @@ struct Builder {
             }
         }
 
-        auto rowDisparity = [&](int n, int z, unsigned y) {
-            float d;
-            if (n == 0 && m7row[y] && m7top >= 0) {
-                float t = (float)((int)y - m7top) / std::max(1.0f, (float)((int)h - 1 - m7top));
-                return M7_FAR * (1.0f - t) + 1.0f * t;  // floor: horizon far, bottom just behind the playfield
+        // Mode 7 floor depth from the game's own zoom: a scanline drawn at k times the texel step of the
+        // nearest floor line is k times as far away. Rotation-only Mode 7 (no zoom change) stays flat.
+        std::vector<float> floorD(h, 1.0f);
+        frameHasM7 = false;
+        bool slope = false;
+        if (in.m7lines && m7top >= 0) {
+            int first = in.m7flags >> 9;
+            float smin = 1e9f, smax = 0;
+            std::vector<float> sc(h, 0.0f);
+            for (unsigned y = 0; y < h; y++) {
+                if (!m7row[y] || first + (int)y >= 240) continue;
+                const int16_t *m = in.m7lines + 8 * (first + y);
+                sc[y] = sqrtf((float)m[0] * m[0] + (float)m[2] * m[2]) / 256.0f;
+                if (sc[y] > 0) { smin = std::min(smin, sc[y]); smax = std::max(smax, sc[y]); }
             }
-            d = (n == 5) ? 7.5f : (n == 0 && m7row[y]) ? 1.0f : disparityFor(z - 32, mode01);
-            if (m7top >= 0 && (int)y < m7top && n != 4 && d > 0.0f) d = M7_FAR + 0.5f * d;  // skyline beyond the horizon
+            slope = smax > smin * 1.15f;
+            const float R0 = 1.0f / (1.0f - 0.8f / 8.5f);  // distance ratio of disparity 1 (just behind the playfield)
+            for (unsigned y = 0; y < h; y++)
+                if (m7row[y] && slope && sc[y] > 0) floorD[y] = (1.0f - 1.0f / (R0 * sc[y] / smin)) * (8.5f / 0.8f);
+            frameHasM7 = !(in.m7flags & 256);  // direct-colour Mode 7 keeps the sheet colours
+        }
+        const float horizonD = (m7top >= 0) ? floorD[m7top] : M7_FAR;
+        float farD = 0;  // farthest floor line: the backdrop and skyline must stay behind it
+        int floorZ = 39;
+        for (unsigned y = 0; y < h; y++) if (m7row[y]) farD = std::max(farD, floorD[y]);
+        if (m7top >= 0) for (unsigned x = 0; x < w; x++) if (in.layer[m7top * w + x] == 6) { floorZ = in.zmain[m7top * w + x]; break; }
+
+        auto rowDisparity = [&](int n, int z, unsigned y) {
+            if (y >= h) y = h - 1;
+            if (n == 0 && m7row[y] && m7top >= 0) return floorD[y];
+            float d = (n == 5) ? std::max(7.5f, farD + 1.0f) : (n == 0 && m7row[y]) ? 1.0f : disparityFor(z - 32, mode01);
+            if (m7top >= 0 && (int)y < m7top && n != 4 && n != 5 && d > 0.0f) d = std::max(d, horizonD + 0.3f + 0.04f * d);  // skyline beyond the horizon
+            // sprites on a sloping floor: just in front of it where they outrank it, just behind where they do not
+            if (m7top >= 0 && n == 4 && m7row[y] && slope) d = z > floorZ ? std::min(d, floorD[y] - 0.3f) : floorD[y] + 0.3f;
             return d;
         };
 
-        // one quad per row span of each (layer, priority) sheet
+        double t1 = nowMs();
+        // one quad per row span of each (layer, priority) sheet: one pass per row finds every sheet's span
         for (int n = 0; n < 5; n++) {
-            bool seen[256] = {false};
-            for (size_t i = 0; i < (size_t)w * h; i++) seen[in.planeZ[n][i]] = true;
-            for (int z = 1; z < 256; z++) {
-                if (!seen[z]) continue;
-                for (unsigned y = 0; y < h; y++) {
-                    const uint8_t *row = &in.planeZ[n][y * w];
-                    int x0 = -1, x1 = -1;
-                    for (unsigned x = 0; x < w; x++) if (row[x] == z) { if (x0 < 0) x0 = (int)x; x1 = (int)x + 1; }
-                    if (x0 >= 0) quads.push_back({(float)x0, (float)x1, (float)y, rowDisparity(n, z, y), (float)n, (float)z});
+            for (unsigned y = 0; y < h; y++) {
+                const uint8_t *row = &in.planeZ[n][y * w];
+                int16_t x0[256], x1[256];
+                uint8_t used[256]; int nUsed = 0;
+                for (unsigned x = 0; x < w; x++) {
+                    uint8_t z = row[x];
+                    if (!z) continue;
+                    bool known = false;
+                    for (int k = 0; k < nUsed; k++) if (used[k] == z) { known = true; break; }
+                    if (!known) { used[nUsed++] = z; x0[z] = (int16_t)x; }
+                    x1[z] = (int16_t)(x + 1);
+                }
+                std::sort(used, used + nUsed);
+                for (int k = 0; k < nUsed; k++) {
+                    int z = used[k];
+                    Quad q{(float)x0[z], (float)x1[z], (float)y, rowDisparity(n, z, y), (float)n, (float)z};
+                    bool floorRow = n == 0 && m7row[y] && m7top >= 0;
+                    // a sloping floor is one continuous surface: the bottom edge meets the next line
+                    q.disparity1 = (floorRow && y + 1 < h && m7row[y + 1]) ? rowDisparity(n, z, y + 1) : q.disparity;
+                    if (n == 4 && slope && m7row[y]) q.disparity1 = (y + 1 < h && m7row[y + 1]) ? rowDisparity(n, z, y + 1) : q.disparity;
+                    if (floorRow && frameHasM7) {
+                        int first = in.m7flags >> 9, line = first + (int)y, next = (y + 1 < h && m7row[y + 1]) ? line + 1 : line;
+                        q.m7 = true;
+                        mode7uv(in.m7lines, in.m7flags, line, (float)x0[z], (float)line, q.m7uv[0][0], q.m7uv[0][1]);
+                        mode7uv(in.m7lines, in.m7flags, line, (float)x1[z], (float)line, q.m7uv[1][0], q.m7uv[1][1]);
+                        mode7uv(in.m7lines, in.m7flags, next, (float)x0[z], (float)line + 1, q.m7uv[2][0], q.m7uv[2][1]);
+                        mode7uv(in.m7lines, in.m7flags, next, (float)x1[z], (float)line + 1, q.m7uv[3][0], q.m7uv[3][1]);
+                    }
+                    quads.push_back(q);
                 }
             }
         }
         if (showBackdrop)
-            for (unsigned y = 0; y < h; y++) quads.push_back({0.0f, (float)w, (float)y, rowDisparity(5, 1, y), 5.0f, 1.0f});
-
+            for (unsigned y = 0; y < h; y++) {
+                Quad q{0.0f, (float)w, (float)y, rowDisparity(5, 1, y), 5.0f, 1.0f};
+                q.disparity1 = q.disparity;
+                quads.push_back(q);
+            }
+        double t2 = nowMs();
+        if (frameHasM7) buildMap7(in);
+        double t3 = nowMs();
         if (look.on) bakeLook(w, h);
+        double t4 = nowMs();
 
         // far to near; equal depth keeps SNES priority order (higher z drawn later)
         std::stable_sort(quads.begin(), quads.end(), [](const Quad &a, const Quad &b) {
             if (a.disparity != b.disparity) return a.disparity > b.disparity;
             return a.z < b.z;
         });
+        double t5 = nowMs();
+        profMs[0] = t1 - t0; profMs[1] = t2 - t1; profMs[2] = t3 - t2; profMs[3] = t4 - t3; profMs[4] = t5 - t4;
+    }
+
+    void buildMap7(const Input &in) {
+        uint64_t hsh = 1469598103934665603ull;
+        auto mix = [&](const uint8_t *p, size_t n) { for (size_t i = 0; i < n; i++) { hsh ^= p[i]; hsh *= 1099511628211ull; } };
+        mix(in.vram, 0x8000 * 2);
+        mix((const uint8_t *)in.cgram, 512);
+        int bright = (in.m7flags >> 4) & 15;
+        hsh ^= (uint64_t)bright * 0x9e3779b97f4a7c15ull;
+        m7flags = in.m7flags;
+        if (hsh == map7Hash && !map7.empty()) return;
+        map7Hash = hsh;
+        map7.resize(1024 * 1024);
+        uint32_t pal[256];
+        for (int i = 0; i < 256; i++) {
+            uint16_t c = in.cgram[i];
+            uint32_t r = (c & 31) * 255 / 31, g = ((c >> 5) & 31) * 255 / 31, b = ((c >> 10) & 31) * 255 / 31;
+            r = r * (bright + 1) / 16; g = g * (bright + 1) / 16; b = b * (bright + 1) / 16;
+            pal[i] = (i ? 0xff000000u : 0u) | (b << 16) | (g << 8) | r;
+        }
+        for (int ty = 0; ty < 128; ty++)
+            for (int tx = 0; tx < 128; tx++) {
+                int tile = in.vram[(ty * 128 + tx) * 2];
+                const uint8_t *td = in.vram + 1 + tile * 128;
+                for (int py = 0; py < 8; py++)
+                    for (int px = 0; px < 8; px++)
+                        map7[(size_t)(ty * 8 + py) * 1024 + tx * 8 + px] = pal[td[(py * 8 + px) * 2]];
+            }
+        map7Dirty = true;
     }
 
     // per-pixel disparity of every sheet pixel, and the nearest disparity at each screen position
     std::vector<float> own, nearest;
 
     void bakeLook(unsigned w, unsigned h) {
-        const size_t plane = (size_t)TEX_H * TEX_W;
+        const size_t plane = (size_t)w * h;  // only the visible frame area
         own.assign((size_t)SLICES * plane, 1e9f);
-        nearest.assign((size_t)w * h, 1e9f);
+        nearest.assign(plane, 1e9f);
         for (const auto &q : quads) {
             int s = (int)q.slice, y = (int)q.v;
             uint32_t *row = slice(s) + (size_t)y * TEX_W;
             for (int x = (int)q.u0; x < (int)q.u1; x++)
                 if ((row[x] >> 24) == (uint32_t)q.z) {
-                    own[(size_t)s * plane + (size_t)y * TEX_W + x] = q.disparity;
+                    own[(size_t)s * plane + (size_t)y * w + x] = q.disparity;
                     float &n = nearest[(size_t)y * w + x];
                     if (q.disparity < n) n = q.disparity;
                 }
@@ -180,7 +305,7 @@ struct Builder {
             for (int y = 0; y < (int)h; y++)
                 for (int x = 0; x < (int)w; x++) {
                     size_t i = (size_t)y * TEX_W + x;
-                    float d = od[i];
+                    float d = od[(size_t)y * w + x];
                     if (d > 1e8f) continue;
                     uint32_t c = t[i], z = c >> 24;
                     float r = (float)(c & 255), g = (float)((c >> 8) & 255), b = (float)((c >> 16) & 255);

@@ -16,6 +16,7 @@ static const char *kVS = R"(#version 300 es
 layout(location = 0) in vec2 aPos;      // texel column, row
 layout(location = 1) in float aDisp;    // disparity in SNES pixels
 layout(location = 2) in vec2 aSheet;    // slice, priority depth
+layout(location = 3) in vec3 aM7;       // HD Mode 7 map texel coords, flag (1 = floor)
 uniform mat4 uViewProj;
 uniform vec4 uScreen;                   // width m, height m, distance m, metres per SNES pixel
 uniform vec4 uDepth;                    // ipd m, disparity scale, disparity offset, unused
@@ -24,10 +25,12 @@ uniform mat4 uModel;                    // placement: screen centre and orientat
 uniform vec2 uStyle;                    // x: 0 screen, 1 box; y: box depth in metres per SNES pixel
 out vec2 vTex;
 flat out vec2 vSheet;
+out vec3 vM7;
+out float vDisp;
 void main() {
     float d = aDisp * uDepth.y + uDepth.z;
     float ipd = uDepth.x;
-    float s = clamp(d * uScreen.w, -2.0 * ipd, 0.9 * ipd);   // on-screen eye shift, never diverging
+    float s = clamp(d * uScreen.w, -2.0 * ipd, 0.96 * ipd);  // on-screen eye shift, never diverging (25x screen distance max)
     float dist = uScreen.z * ipd / (ipd - s);
     vec2 xy = vec2((aPos.x / uFrame.x - 0.5) * uScreen.x, (0.5 - aPos.y / uFrame.y) * uScreen.y);
     vec3 p = uStyle.x < 0.5 ? vec3(xy * (dist / uScreen.z), uScreen.z - dist)   // seen from (0, 0, distance)
@@ -35,6 +38,8 @@ void main() {
     gl_Position = uViewProj * (uModel * vec4(p, 1.0));
     vTex = aPos;
     vSheet = aSheet;
+    vM7 = aM7;
+    vDisp = aDisp;
 }
 )";
 
@@ -42,15 +47,27 @@ static const char *kFS = R"(#version 300 es
 precision highp float;
 precision highp sampler2DArray;
 uniform sampler2DArray uTex;
+uniform sampler2D uMap;                 // 1024x1024 Mode 7 map, mipmapped
 uniform vec2 uFrame;
+uniform float uHaze;                    // pop-up look haze per SNES pixel of depth (0 = off)
 in vec2 vTex;
 flat in vec2 vSheet;
+in vec3 vM7;
+in float vDisp;
 out vec4 oColor;
 void main() {
     ivec2 t = clamp(ivec2(floor(vTex)), ivec2(0), ivec2(uFrame) - 1);
     vec4 c = texelFetch(uTex, ivec3(t, int(vSheet.x + 0.5)), 0);
     if (abs(c.a * 255.0 - vSheet.y) > 0.5) discard;
-    oColor = vec4(c.rgb, 1.0);
+    vec3 rgb = c.rgb;
+    if (vM7.z > 0.5) {  // HD floor: sample the game's own map at full resolution
+        vec4 m = texture(uMap, vM7.xy / 1024.0);
+        if (m.a > 0.5) {
+            float hz = clamp(vDisp * uHaze, 0.0, 0.22);
+            rgb = mix(m.rgb, vec3(0.30, 0.40, 0.58), hz);   // haze target in linear light
+        }
+    }
+    oColor = vec4(rgb, 1.0);
 }
 )";
 
@@ -63,8 +80,9 @@ struct Eye {
 };
 
 struct Renderer {
-    GLuint prog = 0, tex = 0, vao = 0, vbo = 0, ibo = 0;
-    GLint uViewProj, uScreen, uDepth, uFrame, uTex, uModel, uStyle;
+    GLuint prog = 0, tex = 0, vao = 0, vbo = 0, ibo = 0, map = 0;
+    GLint uViewProj, uScreen, uDepth, uFrame, uTex, uModel, uStyle, uMap, uHaze;
+    float haze = 0.0f;
     int indexCount = 0;
     float frameW = 256, frameH = 224;
     Eye eyes[2];
@@ -89,6 +107,13 @@ struct Renderer {
         uTex = glGetUniformLocation(prog, "uTex");
         uModel = glGetUniformLocation(prog, "uModel");
         uStyle = glGetUniformLocation(prog, "uStyle");
+        uMap = glGetUniformLocation(prog, "uMap");
+        uHaze = glGetUniformLocation(prog, "uHaze");
+        glGenTextures(1, &map);
+        glBindTexture(GL_TEXTURE_2D, map);
+        glTexStorage2D(GL_TEXTURE_2D, 11, GL_SRGB8_ALPHA8, 1024, 1024);  // 1024 down to 1x1
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);  // crisp pixels up close
 
         glGenTextures(1, &tex);
         glBindTexture(GL_TEXTURE_2D_ARRAY, tex);
@@ -103,9 +128,11 @@ struct Renderer {
         glBindVertexArray(vao);
         glBindBuffer(GL_ARRAY_BUFFER, vbo);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
-        glEnableVertexAttribArray(0); glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 20, (void *)0);
-        glEnableVertexAttribArray(1); glVertexAttribPointer(1, 1, GL_FLOAT, GL_FALSE, 20, (void *)8);
-        glEnableVertexAttribArray(2); glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 20, (void *)12);
+        const int stride = 8 * 4;  // x y disparity slice z u7 v7 floor
+        glEnableVertexAttribArray(0); glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, stride, (void *)0);
+        glEnableVertexAttribArray(1); glVertexAttribPointer(1, 1, GL_FLOAT, GL_FALSE, stride, (void *)8);
+        glEnableVertexAttribArray(2); glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, stride, (void *)12);
+        glEnableVertexAttribArray(3); glVertexAttribPointer(3, 3, GL_FLOAT, GL_FALSE, stride, (void *)20);
         glBindVertexArray(0);
         return true;
     }
@@ -123,10 +150,26 @@ struct Renderer {
         static std::vector<float> v;
         static std::vector<uint32_t> idx;
         v.clear(); idx.clear();
+        if (b.map7Dirty && !b.map7.empty()) {  // the game changed its Mode 7 map or palette
+            glBindTexture(GL_TEXTURE_2D, map);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1024, 1024, GL_RGBA, GL_UNSIGNED_BYTE, b.map7.data());
+            glGenerateMipmap(GL_TEXTURE_2D);
+            b.map7Dirty = false;
+        }
+        {   // repeat mode 0 wraps the map; other modes show nothing (or tile 0) outside it
+            GLint wrap = ((b.m7flags >> 2) & 3) == 0 ? GL_REPEAT : GL_CLAMP_TO_EDGE;
+            glBindTexture(GL_TEXTURE_2D, map);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap);
+        }
         for (const auto &q : b.quads) {
-            uint32_t base = (uint32_t)(v.size() / 5);
+            uint32_t base = (uint32_t)(v.size() / 8);
             const float corners[4][2] = {{q.u0, q.v}, {q.u1, q.v}, {q.u0, q.v + 1}, {q.u1, q.v + 1}};
-            for (auto &c : corners) { v.insert(v.end(), {c[0], c[1], q.disparity, q.slice, q.z}); }
+            for (int k = 0; k < 4; k++) {
+                float d = k < 2 ? q.disparity : q.disparity1;
+                v.insert(v.end(), {corners[k][0], corners[k][1], d, q.slice, q.z,
+                                   q.m7 ? q.m7uv[k][0] : 0.0f, q.m7 ? q.m7uv[k][1] : 0.0f, q.m7 ? 1.0f : 0.0f});
+            }
             idx.insert(idx.end(), {base, base + 2, base + 1, base + 1, base + 2, base + 3});
         }
         glBindBuffer(GL_ARRAY_BUFFER, vbo);
@@ -192,6 +235,11 @@ struct Renderer {
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D_ARRAY, tex);
             glUniform1i(uTex, 0);
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, map);
+            glUniform1i(uMap, 1);
+            glUniform1f(uHaze, haze);
+            glActiveTexture(GL_TEXTURE0);
             glBindVertexArray(vao);
             glDrawElements(GL_TRIANGLES, indexCount, GL_UNSIGNED_INT, nullptr);
             glBindVertexArray(0);

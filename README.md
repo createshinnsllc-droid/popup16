@@ -12,7 +12,9 @@ own depth, like a pop-up book. Move your head and the scene has real parallax.
 - **Diorama 3D on Quest 3:** every layer drawn alone and placed in real 3D. Sheets
   follow the console's own priority order, so the picture seen head-on is exactly the
   original frame (tested pixel for pixel).
-- **Mode 7 floors** slope away to the horizon; skylines sit beyond it.
+- **Mode 7 floors rebuilt in 3D and HD:** each scanline's distance comes from the game's own Mode 7
+  zoom, forming one continuous sloped surface, and the floor is redrawn from the full 1024x1024
+  track map at headset resolution. Racers stand on it; skylines sit beyond the horizon.
 - **Comfort limits** scaled to your eye spacing, so your eyes never have to diverge.
 - 60 fps emulation on a 120 Hz display; quick resume where you left off.
 - Rewind (hold the left stick in), slow motion and fast speeds, four save slots with pictures.

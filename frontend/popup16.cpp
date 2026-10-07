@@ -424,6 +424,8 @@ int main(int argc, char **argv) {
                 }
                 din.planeColor[n] = pcol[n].data(); din.planeZ[n] = pzz[n].data();
             }
+            auto getM7 = (void (*)(const int16_t **, const uint8_t **, const uint16_t **, int *))dlsym(core.h, "snes3d_get_mode7");
+            if (getM7) getM7(&din.m7lines, &din.vram, &din.cgram, &din.m7flags);
             static diorama::Builder db;
             db.look.on = false;  // the exactness check runs on the plain sheets
             db.build(din);
@@ -437,6 +439,47 @@ int main(int argc, char **argv) {
             for (size_t i = 0; i < out.size(); i++) bad += out[i] != (db.lut[cur.rgb565[i]] & 0xffffff);
             int sheets = 0; { std::vector<int> seen; for (auto &q : db.quads) { int k = (int)q.slice * 256 + (int)q.z; if (std::find(seen.begin(), seen.end(), k) == seen.end()) seen.push_back(k); } sheets = (int)seen.size(); }
             printf("diorama: %zu quads, %d sheets, head-on mismatch %d of %zu px\n", db.quads.size(), sheets, bad, out.size());
+            if (db.frameHasM7) {
+                // HD floor check: the map colour at each floor pixel's centre must match what the SNES drew
+                int first = din.m7flags >> 9, n7 = 0, ok7 = 0;
+                float dmin = 1e9f, dmax = -1e9f;
+                for (unsigned y = 0; y < h; y++)
+                    for (unsigned x = 0; x < w; x++) {
+                        size_t i = (size_t)y * w + x;
+                        if (cur.layers[i] != 6 || !din.planeZ[0][i]) continue;
+                        float u, v;
+                        diorama::mode7uv(din.m7lines, din.m7flags, first + (int)y, x + 0.5f, first + y + 0.5f, u, v);
+                        uint32_t m = db.map7[((int)floorf(v) & 1023) * 1024 + ((int)floorf(u) & 1023)];
+                        uint16_t c = din.planeColor[0][i];
+                        int r1 = (c >> 11) & 31, g1 = (c >> 6) & 31, b1 = c & 31;
+                        int r2 = (m & 255) >> 3, g2 = ((m >> 8) & 255) >> 3, b2 = ((m >> 16) & 255) >> 3;
+                        n7++; ok7 += abs(r1 - r2) <= 2 && abs(g1 - g2) <= 2 && abs(b1 - b2) <= 2;
+                    }
+                for (auto &q : db.quads) if (q.m7) { dmin = std::min(dmin, q.disparity); dmax = std::max(dmax, q.disparity); }
+                printf("mode7: %d floor px, %d match the HD map (%.1f%%), floor disparity %.2f..%.2f\n", n7, ok7, 100.0 * ok7 / std::max(n7, 1), dmin, dmax);
+                // preview: 4x frame, floor pixels resampled from the HD map (bilinear across the 4 nearest texels)
+                const int S4 = 4, W4 = w * S4, H4 = h * S4, rb4 = (W4 * 3 + 3) & ~3;
+                std::vector<uint8_t> pb(54 + (size_t)rb4 * H4, 0);
+                auto p32 = [&](int o, uint32_t v) { memcpy(&pb[o], &v, 4); };
+                pb[0] = 'B'; pb[1] = 'M'; p32(2, (uint32_t)pb.size()); p32(10, 54); p32(14, 40);
+                p32(18, W4); p32(22, H4); pb[26] = 1; pb[28] = 24; p32(34, (uint32_t)(rb4 * H4));
+                for (int Y = 0; Y < H4; Y++)
+                    for (int X = 0; X < W4; X++) {
+                        int x = X / S4, y = Y / S4;
+                        size_t i = (size_t)y * w + x;
+                        uint32_t c = db.lut[cur.rgb565[i]];
+                        if (cur.layers[i] == 6) {
+                            float u, v;
+                            diorama::mode7uv(din.m7lines, din.m7flags, first + y, (X + 0.5f) / S4, first + (Y + 0.5f) / S4, u, v);
+                            int iu = (int)floorf(u) & 1023, iv = (int)floorf(v) & 1023;
+                            uint32_t m = db.map7[iv * 1024 + iu];
+                            if (m >> 24) c = m & 0xffffff;
+                        }
+                        uint8_t *px = &pb[54 + (size_t)(H4 - 1 - Y) * rb4 + X * 3];
+                        px[0] = (c >> 16) & 255; px[1] = (c >> 8) & 255; px[2] = c & 255;
+                    }
+                writeFile(std::string(planePrefix) + "hd.bmp", pb.data(), pb.size());
+            }
             {   // the same view with the pop-up look baked in, written next to the planes
                 db.look.on = true;
                 db.build(din);

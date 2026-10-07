@@ -6,7 +6,7 @@ SNES9X_BASE=1bcc369e89f08243e0a462882fb1f3e42e51de3a
 if [[ ! -d snes9x ]]; then
   git clone https://github.com/snes9xgit/snes9x.git snes9x
   git -C snes9x checkout -b stereo3d $SNES9X_BASE
-  git -C snes9x am ../snes9x-stereo3d.patch  # two commits: layer ids, solo layer planes
+  git -C snes9x am ../snes9x-stereo3d.patch  # layer ids, solo layer planes, Mode 7 state
 fi
 OXR=quest/third_party
 if [[ ! -d $OXR/oxr ]]; then

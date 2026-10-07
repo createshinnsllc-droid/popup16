@@ -26,6 +26,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -48,6 +51,7 @@ extern "C" const uint8_t *snes3d_get_depths(void);
 extern "C" void snes3d_enable_planes(int on);
 extern "C" const uint16_t *snes3d_get_plane_color(int n);
 extern "C" const uint8_t *snes3d_get_plane_z(int n);
+extern "C" void snes3d_get_mode7(const int16_t **lines, const uint8_t **vram, const uint16_t **cgram, int *flags);
 
 // input/diagnostic trace kept on the headset (files/input.log) so a normal play session can be read back later
 static FILE *traceFile = nullptr;
@@ -226,7 +230,60 @@ static int32_t onInput(android_app *, AInputEvent *e) {
 static stereo::Frame frame;
 static std::vector<uint16_t> planeColor[5];
 static std::vector<uint8_t> planeZ[5];
-static diorama::Builder sheets;
+static diorama::Builder sheets;  // used by the headless debug timing only
+
+// Sheet building runs on its own thread: the display loop hands over a copy of each new frame and
+// uploads whichever build finished last, so a slow build never delays a headset frame.
+struct BuildWorker {
+    struct Job {
+        unsigned w = 0, h = 0;
+        std::vector<uint16_t> rgb565, planeColor[5];
+        std::vector<uint8_t> layers, depths, planeZ[5], vram;
+        std::vector<int16_t> lines;
+        std::vector<uint16_t> cgram;
+        int flags = 0;
+        bool ramp = true, look = true, backdrop = true;
+    };
+    Job job;                      // filled by the display loop under lock
+    bool hasJob = false, quit = false;
+    diorama::Builder builders[3];     // three, so building never touches the one waiting or uploading
+    int ready = -1, uploading = -1;   // finished build waiting for upload; build being uploaded
+    std::mutex m;
+    std::condition_variable cv;
+    std::thread th;
+
+    void start() { th = std::thread([this] { loop(); }); }
+    void stop() { { std::lock_guard<std::mutex> l(m); quit = true; } cv.notify_one(); if (th.joinable()) th.join(); }
+    void loop() {
+        Job local;
+        while (true) {
+            int target;
+            {
+                std::unique_lock<std::mutex> l(m);
+                cv.wait(l, [this] { return hasJob || quit; });
+                if (quit) return;
+                std::swap(local, job);
+                hasJob = false;
+                target = 0;
+                while (target == ready || target == uploading) target++;
+            }
+            diorama::Builder &b = builders[target];
+            diorama::Input din{local.w, local.h, local.rgb565.data(), local.layers.data(), local.depths.data(), {}, {}};
+            for (int n = 0; n < 5; n++) { din.planeColor[n] = local.planeColor[n].data(); din.planeZ[n] = local.planeZ[n].data(); }
+            if (!local.lines.empty()) { din.m7lines = local.lines.data(); din.vram = local.vram.data(); din.cgram = local.cgram.data(); din.m7flags = local.flags; }
+            b.mode7Ramp = local.ramp; b.look.on = local.look; b.showBackdrop = local.backdrop;
+            b.build(din);
+            std::lock_guard<std::mutex> l(m);
+            ready = target;
+        }
+    }
+};
+static BuildWorker worker;
+// Mode 7 state copied with each frame (the core keeps rendering the next one meanwhile)
+static std::vector<int16_t> m7lines(240 * 8);
+static std::vector<uint8_t> m7vram(0x10000);
+static std::vector<uint16_t> m7cgram(256);
+static int m7flags = 0;
 static render::Renderer renderer;
 static bool newFrame = false;
 static bool gameLoaded = false;
@@ -249,6 +306,16 @@ static bool environment(unsigned cmd, void *data) {
 static void video_cb(const void *data, unsigned w, unsigned h, size_t pitch) {
     if (!data) return;
     frame.capture(data, w, h, pitch, snes3d_get_layers(), snes3d_get_depths());
+    {
+        const int16_t *l; const uint8_t *vr; const uint16_t *cg;
+        snes3d_get_mode7(&l, &vr, &cg, &m7flags);
+        memcpy(m7lines.data(), l, 240 * 8 * 2);
+        memcpy(m7cgram.data(), cg, 512);
+        // VRAM is only needed when Mode 7 is on screen; skip the 64 KiB copy otherwise
+        bool any7 = false;
+        for (size_t i = 0; i < frame.layers.size() && !any7; i += 3) any7 = frame.layers[i] == 6;
+        if (any7) memcpy(m7vram.data(), vr, 0x10000);
+    }
     size_t ppl = pitch / 2;
     for (int n = 0; n < 5; n++) {
         const uint16_t *c = snes3d_get_plane_color(n);
@@ -1145,6 +1212,7 @@ void android_main(android_app *app) {
 
     if (!initXR(app)) { LOGE("OpenXR init failed"); ANativeActivity_finish(app->activity); }
     startAudio();
+    worker.start();
     {   // test hook: files/autostart.txt names a ROM to load immediately (file is consumed)
         std::vector<uint8_t> a;
         if (readFile(filesDir + "/autostart.txt", a)) {
@@ -1189,6 +1257,21 @@ void android_main(android_app *app) {
                 int hr = 0;
                 double t0 = nowSec();
                 while (t - lastEmu >= 1.0 / avFps) { runFrame(); hr++; lastEmu += 1.0 / avFps; if (t - lastEmu > 0.5) lastEmu = t; }
+                if (hr && frame.valid) {  // debug: time the diorama build the headset does per displayed frame
+                    static double bMs = 0, part[5]; static int bN = 0;
+                    double b0 = nowSec();
+                    diorama::Input din{frame.w, frame.h, frame.rgb565.data(), frame.layers.data(), frame.depths.data(), {}, {}};
+                    for (int n = 0; n < 5; n++) { din.planeColor[n] = planeColor[n].data(); din.planeZ[n] = planeZ[n].data(); }
+                    din.m7lines = m7lines.data(); din.vram = m7vram.data(); din.cgram = m7cgram.data(); din.m7flags = m7flags;
+                    sheets.look.on = on(cfg.popLook);
+                    sheets.build(din);
+                    bMs += (nowSec() - b0) * 1000.0; bN++;
+                    for (int k = 0; k < 5; k++) part[k] += sheets.profMs[k];
+                    if (bN == 600) { int q7 = 0; for (auto &q : sheets.quads) q7 += q.m7;
+                                     trace("headless: diorama build %.2f ms (slices %.2f spans %.2f map %.2f look %.2f sort %.2f), %zu quads (%d floor)",
+                                           bMs / bN, part[0] / bN, part[1] / bN, part[2] / bN, part[3] / bN, part[4] / bN, sheets.quads.size(), q7);
+                                     bMs = 0; bN = 0; for (double &p2 : part) p2 = 0; }
+                }
                 static double frameMs = 0; static int frameN = 0;
                 if (hr) { frameMs += (nowSec() - t0) * 1000.0 / hr; frameN++; }
                 if (frameN == 600) { trace("headless: %.2f ms per frame incl. rewind snapshots, history %zu steps / %zu KB", frameMs / frameN, rewinder.depth(), rewinder.bytes() / 1024); frameMs = 0; frameN = 0; }
@@ -1291,15 +1374,30 @@ void android_main(android_app *app) {
             }
         }
 
-        if (newFrame && frame.valid) {
-            diorama::Input din{frame.w, frame.h, frame.rgb565.data(), frame.layers.data(), frame.depths.data(), {}, {}};
-            for (int n = 0; n < 5; n++) { din.planeColor[n] = planeColor[n].data(); din.planeZ[n] = planeZ[n].data(); }
-            sheets.mode7Ramp = on(cfg.mode7Ramp);
-            sheets.look.on = on(cfg.popLook);
-            sheets.showBackdrop = on(cfg.sky) || !on(cfg.room);
-            sheets.build(din);
-            renderer.upload(sheets, frame.w, frame.h);
+        if (newFrame && frame.valid) {  // hand the frame to the build thread (replacing any older pending one)
+            {
+                std::lock_guard<std::mutex> l(worker.m);
+                BuildWorker::Job &j = worker.job;
+                j.w = frame.w; j.h = frame.h;
+                j.rgb565 = frame.rgb565; j.layers = frame.layers; j.depths = frame.depths;
+                for (int n = 0; n < 5; n++) { j.planeColor[n] = planeColor[n]; j.planeZ[n] = planeZ[n]; }
+                j.lines = m7lines; j.vram = m7vram; j.cgram = m7cgram; j.flags = m7flags;
+                j.ramp = on(cfg.mode7Ramp); j.look = on(cfg.popLook); j.backdrop = on(cfg.sky) || !on(cfg.room);
+                worker.hasJob = true;
+            }
+            worker.cv.notify_one();
             newFrame = false;
+        }
+        {   // upload the newest finished build
+            int r;
+            { std::lock_guard<std::mutex> l(worker.m); r = worker.ready; worker.ready = -1; worker.uploading = r; }
+            if (r >= 0) {
+                diorama::Builder &b = worker.builders[r];
+                renderer.haze = b.look.on ? b.look.haze : 0.0f;
+                renderer.upload(b, b.lastW, b.lastH);
+                std::lock_guard<std::mutex> l(worker.m);
+                worker.uploading = -1;
+            }
         }
         if (menuMode != MENU_NONE && (menuDirty || (!toast.empty() && nowSec() > toastUntil))) {
             if (nowSec() > toastUntil) toast.clear();
@@ -1390,6 +1488,7 @@ void android_main(android_app *app) {
         xrEndFrame(session, &fei);
     }
 
+    worker.stop();
     unloadGame();
     saveGlobal();
     stopAudio();
