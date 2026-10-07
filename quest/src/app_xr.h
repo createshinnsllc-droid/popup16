@@ -22,7 +22,8 @@ static bool hasRoomView() { return hasPassthrough; }
 static XrPassthroughFB passthrough = XR_NULL_HANDLE;
 static XrPassthroughLayerFB passthroughLayer = XR_NULL_HANDLE;
 static bool passthroughRunning = false;
-static bool recenterPending = false;  // re-place the menu once the new head pose is known
+static bool recenterPending = false;  // bring the game back in front once the new head pose is known
+static double recenterAt = 0;          // the runtime applies a recenter a moment after announcing it
 static void resetPassthrough();
 static Swap menuSwap, cursorSwap;
 static XrActionSet actionSet;
@@ -418,6 +419,7 @@ static void handleXrEvents(android_app *app) {
             // place relative to the new centre (it stays in front of you), and an open menu follows.
             trace("recentered");
             recenterPending = true;
+            recenterAt = nowSec() + 0.3;
         } else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
             ANativeActivity_finish(app->activity);
         }
