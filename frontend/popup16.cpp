@@ -545,7 +545,11 @@ int main(int argc, char **argv) {
             }
             {   // the same view with the pop-up look baked in, written next to the planes
                 db.look.on = true;
-                db.build(din);
+                {
+                    double best = 1e9;
+                    for (int rep = 0; rep < 20; rep++) { db.build(din); best = std::min(best, db.profMs[3]); }
+                    printf("look bake: %.3f ms (best of 20)\n", best);
+                }
                 std::vector<uint32_t> lk(w * h, 0);
                 for (const auto &q : db.quads)
                     for (int x = (int)q.u0; x < (int)q.u1; x++) {

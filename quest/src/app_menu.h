@@ -8,7 +8,8 @@ static const int MENU_W = 1024, MENU_H = 768, CELL_W = 16, CELL_H = 32;
 static const int COLS = MENU_W / CELL_W, ROWS = MENU_H / CELL_H;
 static std::vector<uint32_t> menuPixels(MENU_W * MENU_H);
 // laser pointer on the menu panel, in menu-image pixels (set each frame by the pointer code)
-static struct { bool hover = false, click = false; int px = 0, py = 0; } ptr;
+static struct { bool hover = false, click = false; int px = 0, py = 0; float lx = 0, ly = 0; } ptr;
+static int panelH = 768;  // used height of the menu image (short pages get a short panel)
 static int libRow0 = 0;                      // first visible library row (for pointer hits)
 static int tabX0[3] = {0}, tabX1[3] = {0};   // library tab hit ranges in pixels
 enum MenuMode { MENU_NONE, MENU_ROMS, MENU_PAUSE, MENU_HELP, MENU_ABOUT, MENU_ARRANGE, MENU_SLOTS, MENU_CONTROLS };
@@ -196,7 +197,7 @@ static void drawSlots() {
         if (exists && readFile(slotPath(n) + ".thumb", th) && th.size() > 4) {
             uint16_t wh[2]; memcpy(wh, th.data(), 4);
             const uint16_t *px = (const uint16_t *)(th.data() + 4);
-            if (th.size() >= 4 + (size_t)wh[0] * wh[1] * 2) {
+            if (wh[0] >= 16 && wh[1] >= 16 && wh[0] <= 1024 && wh[1] <= 1024 && th.size() >= 4 + (size_t)wh[0] * wh[1] * 2) {
                 const int tw = 292, tht = 256, tx = x0 + 102, ty = y0 + 28;
                 for (int y = 0; y < tht; y++)
                     for (int x = 0; x < tw; x++) {
@@ -216,8 +217,14 @@ static void drawSlots() {
 }
 
 static void renderMenu() {
+    // short pause pages get a panel just tall enough for them, instead of a mostly empty board
+    panelH = MENU_H;
+    if (menuMode == MENU_PAUSE) {
+        int n = (int)pausePages[pausePage].size();
+        panelH = std::min(MENU_H, (n + 2) * CELL_H + (pausePage == 2 ? 56 : 0) + 64);
+    }
     std::fill(menuPixels.begin(), menuPixels.end(), 0u);         // transparent outside the panel
-    fillRound(0, 0, MENU_W, MENU_H, 28, C_BG);
+    fillRound(0, 0, MENU_W, panelH, 28, C_BG);
     for (int x = 24; x < MENU_W - 24; x++) menuPixels[(CELL_H + 6) * MENU_W + x] = 0xff3a3028;  // header rule
     if (menuMode == MENU_NONE) {  // playing: only a notice strip (see the small quad in the frame loop)
         if (!toast.empty()) drawText(1, 1, toast.substr(0, COLS - 2), C_HI);
@@ -319,7 +326,7 @@ static void renderMenu() {
             drawSmall(32, (int)(items.size() + 3) * CELL_H, "Move the game any time: point at the bar under it and hold the trigger.", C_TEXT);
             drawSmall(32, (int)(items.size() + 3) * CELL_H + 20, "While holding, push the thumbstick up or down to resize it.", C_TEXT);
         }
-        drawSmall(16, MENU_H - 28, "Point and pull the trigger, or use the sticks and A.   B: back   Left Y: close", C_DIM);
+        drawSmall(16, panelH - 28, "Point and pull the trigger, or use the sticks and A.   B: back   Left Y: close", C_DIM);
     }
     else if (menuMode == MENU_ABOUT) {
         for (int i = 0; i < ROWS - 1 && aboutTop + i < (int)aboutLines.size(); i++)

@@ -28,6 +28,11 @@ static XrVector3f vmul(XrVector3f a, float k) { return {a.x * k, a.y * k, a.z * 
 static float vdot(XrVector3f a, XrVector3f b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
 static XrVector3f vcross(XrVector3f a, XrVector3f b) { return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; }
 static XrVector3f vnorm(XrVector3f a) { float n = sqrtf(vdot(a, a)); return n > 1e-6f ? vmul(a, 1 / n) : v3(0, 0, -1); }
+// the panel keeps its top edge where the menu opened and is only as tall as its page
+static void panelFrame(XrVector3f &centre, float &heightM) {
+    heightM = MENU_WM * panelH / MENU_W;
+    centre = vadd(menuPos, qrot(menuRot, v3(0, (MENU_HM - heightM) / 2, 0)));
+}
 
 // ray against a rectangle in a frame (pos, rot); returns local x, y on hit
 static bool rayRect(XrVector3f o, XrVector3f d, XrVector3f pos, Quat rot, float hw, float hh, float &lx, float &ly, float &t) {
@@ -76,15 +81,18 @@ static void pointerUpdate(XrTime t) {
 
     if (menuMode != MENU_NONE && menuMode != MENU_ARRANGE) {
         bool hit[2] = {false, false}; float lx[2], ly[2], tt[2];
+        XrVector3f pc; float ph;
+        panelFrame(pc, ph);
         for (int h = 0; h < 2; h++)
-            if (valid[h]) hit[h] = rayRect(org[h], dir[h], menuPos, menuRot, MENU_WM / 2, MENU_HM / 2, lx[h], ly[h], tt[h]);
+            if (valid[h]) hit[h] = rayRect(org[h], dir[h], pc, menuRot, MENU_WM / 2, ph / 2, lx[h], ly[h], tt[h]);
         for (int h = 0; h < 2; h++) if (pressed[h] && hit[h]) pointHand = h;
         if (!hit[pointHand] && hit[1 - pointHand]) pointHand = 1 - pointHand;
         int h = pointHand;
         ptr.hover = hit[h];
         if (hit[h]) {
-            int px = (int)((lx[h] / MENU_WM + 0.5f) * MENU_W), py = (int)((0.5f - ly[h] / MENU_HM) * MENU_H);
+            int px = (int)((lx[h] / MENU_WM + 0.5f) * MENU_W), py = (int)((0.5f - ly[h] / ph) * panelH);
             if (px != ptr.px || py != ptr.py) { ptr.px = px; ptr.py = py; }
+            ptr.lx = lx[h]; ptr.ly = ly[h];
             if (pressed[h]) ptr.click = true;
         }
         for (int k = 0; k < 2; k++)
