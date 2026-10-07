@@ -79,7 +79,7 @@ struct Settings {
     // per game
     float strength = 1.0f, convergence = 0.0f, mode7Ramp = 1, swapEyes = 0, stereoOn = 1;
     // global: how and where the diorama sits in the room
-    float screenWidth = 2.4f, distance = 2.2f, room = 0, box = 0, popLook = 1, sky = 1, speed = 1;
+    float screenWidth = 2.4f, distance = 2.2f, room = 0, box = 0, popLook = 1, sky = 1, speed = 1, table = 0;
     float px = 0, py = 0, pz = -2.2f, qx = 0, qy = 0, qz = 0, qw = 1;
 };
 static Settings cfg;
@@ -89,7 +89,7 @@ static const struct { const char *name; float Settings::*field; bool global; } k
     {"mode7Ramp", &Settings::mode7Ramp, false}, {"swapEyes", &Settings::swapEyes, false},
     {"stereoOn", &Settings::stereoOn, false}, {"screenWidth", &Settings::screenWidth, true},
     {"distance", &Settings::distance, true}, {"room", &Settings::room, true}, {"box", &Settings::box, true},
-    {"popLook", &Settings::popLook, true}, {"sky", &Settings::sky, true}, {"speed", &Settings::speed, true},
+    {"popLook", &Settings::popLook, true}, {"sky", &Settings::sky, true}, {"speed", &Settings::speed, true}, {"table", &Settings::table, true},
     {"px", &Settings::px, true}, {"py", &Settings::py, true}, {"pz", &Settings::pz, true},
     {"qx", &Settings::qx, true}, {"qy", &Settings::qy, true}, {"qz", &Settings::qz, true}, {"qw", &Settings::qw, true},
 };
@@ -674,6 +674,10 @@ static const std::vector<uint32_t> *cover(const std::string &rom) {
 static const int MENU_W = 1024, MENU_H = 768, CELL_W = 16, CELL_H = 32;
 static const int COLS = MENU_W / CELL_W, ROWS = MENU_H / CELL_H;
 static std::vector<uint32_t> menuPixels(MENU_W * MENU_H);
+// laser pointer on the menu panel, in menu-image pixels (set each frame by the pointer code)
+static struct { bool hover = false, click = false; int px = 0, py = 0; } ptr;
+static int libRow0 = 0;                      // first visible library row (for pointer hits)
+static int tabX0[3] = {0}, tabX1[3] = {0};   // library tab hit ranges in pixels
 enum MenuMode { MENU_NONE, MENU_ROMS, MENU_PAUSE, MENU_HELP, MENU_ABOUT, MENU_ARRANGE, MENU_SLOTS, MENU_CONTROLS };
 static int controlsSel = 0;  // rows: actions, then scope, reset, done
 static int slotSel = 0;
@@ -733,6 +737,15 @@ static void drawSmall(int px, int py, const std::string &s, uint32_t color) {
     }
 }
 
+static void fillRound(int x0, int y0, int w, int h, int r, uint32_t c) {  // rounded rectangle
+    for (int y = std::max(0, y0); y < std::min(MENU_H, y0 + h); y++)
+        for (int x = std::max(0, x0); x < std::min(MENU_W, x0 + w); x++) {
+            int dx = x < x0 + r ? x0 + r - x : x >= x0 + w - r ? x - (x0 + w - r - 1) : 0;
+            int dy = y < y0 + r ? y0 + r - y : y >= y0 + h - r ? y - (y0 + h - r - 1) : 0;
+            if (dx * dx + dy * dy <= r * r) menuPixels[y * MENU_W + x] = c;
+        }
+}
+
 static void drawText(int col, int row, const std::string &s, uint32_t color, uint32_t bg = 0) {
     for (size_t i = 0; i < s.size() && col + (int)i < COLS; i++) {
         unsigned char c = (unsigned char)s[i];
@@ -751,16 +764,50 @@ static const uint32_t C_BG = 0xff201812, C_TEXT = 0xffe0e0e0, C_DIM = 0xff909090
 
 
 enum PauseItem { P_RESUME, P_CONTROLS, P_SPEED, P_DEPTH, P_CONV, P_3D, P_MODE7, P_SWAP, P_ROOM, P_STYLE, P_LOOK, P_SKY,
-                 P_ARRANGE, P_RESET, P_SIZE, P_DIST, P_SAVE, P_LOAD, P_SHOT, P_CLIP, P_GAMES, P_ABOUT, PAUSE_N };
+                 P_TABLE, P_RESET, P_SIZE, P_DIST, P_SAVE, P_LOAD, P_SHOT, P_CLIP, P_GAMES, P_ABOUT,
+                 P_PAGE_PICTURE, P_PAGE_ROOM, P_BACK, PAUSE_N };
 static const char *pauseItems[PAUSE_N] = {
     "Resume", "Controls & remapping", "Game speed", "3D depth", "Convergence", "3D on/off", "Mode 7 floor depth", "Swap eyes",
-    "Surroundings", "3D style", "Pop-up look", "Show sky", "Move & resize...", "Reset position",
+    "Surroundings", "3D style", "Pop-up look", "Show sky", "Tabletop mode", "Bring it in front of me",
     "Screen size", "Screen distance", "Save state", "Load state", "Take screenshot", "Save last 30 s as video",
-    "Choose game", "About & licenses"};
+    "Choose game", "About & licenses", "Picture & 3D  >", "Room & placement  >", "<  Back"};
+// the pause menu is three short pages instead of one long list
+static const std::vector<int> pausePages[3] = {
+    {P_RESUME, P_GAMES, P_SAVE, P_LOAD, P_SHOT, P_CLIP, P_PAGE_PICTURE, P_PAGE_ROOM, P_CONTROLS, P_ABOUT},
+    {P_BACK, P_DEPTH, P_CONV, P_3D, P_LOOK, P_MODE7, P_SWAP, P_SPEED},
+    {P_BACK, P_TABLE, P_ROOM, P_SKY, P_STYLE, P_SIZE, P_DIST, P_RESET}};
+static const char *pageTitles[3] = {nullptr, "Picture & 3D", "Room & placement"};
+static int pausePage = 0;
 static bool adjustable(int i) { return i == P_SPEED || i == P_DEPTH || i == P_CONV || i == P_SIZE || i == P_DIST; }
-static bool toggle(int i) { return i == P_3D || i == P_MODE7 || i == P_SWAP || i == P_ROOM || i == P_STYLE || i == P_LOOK || i == P_SKY; }
-static void defaultPlacement() {
-    cfg.px = 0; cfg.py = 0; cfg.pz = -cfg.distance; cfg.qx = cfg.qy = cfg.qz = 0; cfg.qw = 1;
+static bool toggle(int i) { return i == P_3D || i == P_MODE7 || i == P_SWAP || i == P_ROOM || i == P_STYLE || i == P_LOOK || i == P_SKY || i == P_TABLE; }
+// where the head is (LOCAL space), updated every frame; menus and placement presets follow its yaw
+static float headX = 0, headY = 0, headZ = 0, headYaw = 0;
+static void yawFwd(float &fx, float &fz) { fx = -sinf(headYaw); fz = -cosf(headYaw); }
+static void placeMenu();
+static void defaultPlacement() {  // straight ahead of where you are looking, upright
+    float fx, fz; yawFwd(fx, fz);
+    cfg.px = headX + fx * cfg.distance; cfg.py = headY; cfg.pz = headZ + fz * cfg.distance;
+    cfg.qx = 0; cfg.qy = sinf(headYaw / 2); cfg.qz = 0; cfg.qw = cosf(headYaw / 2);
+}
+// Tabletop: a small pop-up box standing on the table in front of you, room visible around it
+static bool hasRoomView();
+static void setTabletop(bool want) {
+    float fx, fz; yawFwd(fx, fz);
+    if (want) {
+        cfg.table = 1; cfg.box = 1; cfg.sky = 0; cfg.popLook = 1;
+        if (hasRoomView()) cfg.room = 1;
+        cfg.screenWidth = 0.7f;
+        cfg.px = headX + fx * 0.65f; cfg.py = headY - 0.40f; cfg.pz = headZ + fz * 0.65f;
+        // face you, leaning back a little like a book propped open
+        float yq = sinf(headYaw / 2), yw = cosf(headYaw / 2), t = -0.26f / 2;  // -15 degrees about x
+        float tx = sinf(t), tw = cosf(t);
+        cfg.qx = yw * tx; cfg.qy = yq * tw; cfg.qz = -yq * tx; cfg.qw = yw * tw;
+        cfg.distance = 0.75f;
+    } else {
+        cfg.table = 0; cfg.box = 0; cfg.room = 0; cfg.sky = 1;
+        cfg.screenWidth = 2.4f; cfg.distance = 2.2f;
+        defaultPlacement();
+    }
 }
 
 static void showToast(const std::string &t);
@@ -817,7 +864,9 @@ static void drawSlots() {
 }
 
 static void renderMenu() {
-    std::fill(menuPixels.begin(), menuPixels.end(), C_BG);
+    std::fill(menuPixels.begin(), menuPixels.end(), 0u);         // transparent outside the panel
+    fillRound(0, 0, MENU_W, MENU_H, 28, C_BG);
+    for (int x = 24; x < MENU_W - 24; x++) menuPixels[(CELL_H + 6) * MENU_W + x] = 0xff3a3028;  // header rule
     if (menuMode == MENU_NONE) {  // playing: only a notice strip (see the small quad in the frame loop)
         if (!toast.empty()) drawText(1, 1, toast.substr(0, COLS - 2), C_HI);
         menuDirty = false;
@@ -830,7 +879,8 @@ static void renderMenu() {
         int tx = 12;
         for (int t = 0; t < TAB_N; t++) {
             std::string label = std::string(" ") + tabs[t] + " ";
-            if (t == libTab) for (int y = 2; y < CELL_H - 2; y++) for (int x = tx * CELL_W; x < (tx + (int)label.size()) * CELL_W; x++) menuPixels[y * MENU_W + x] = C_SELBG;
+            tabX0[t] = tx * CELL_W; tabX1[t] = (tx + (int)label.size()) * CELL_W;
+            if (t == libTab) fillRound(tx * CELL_W, 2, (int)label.size() * CELL_W, CELL_H - 4, 10, C_SELBG);
             drawText(tx, 0, label, t == libTab ? 0xffffffff : C_DIM);
             tx += (int)label.size() + 1;
         }
@@ -844,6 +894,7 @@ static void renderMenu() {
             const int cols = 4, cardW = 248, cardH = 336, top = 40;
             int row0 = std::max(0, romSel / cols - 1);
             row0 = std::min(row0, std::max(0, ((int)libView.size() - 1) / cols - 1));
+            libRow0 = row0;
             for (int i = 0; i < 2 * cols; i++) {
                 int idx = row0 * cols + i;
                 if (idx >= (int)libView.size()) break;
@@ -882,10 +933,12 @@ static void renderMenu() {
         snprintf(buf, sizeof buf, "%d/%d  A: play  X: favorite  grips: tabs  B: back", libView.empty() ? 0 : romSel + 1, (int)libView.size());
         drawText(1, ROWS - 1, buf, C_DIM);
     } else if (menuMode == MENU_PAUSE) {
-        std::string n = stem();
-        if ((int)n.size() > COLS - 2) n = n.substr(0, COLS - 2);
-        drawText(1, 0, n, C_HI);
-        for (int i = 0; i < PAUSE_N; i++) {
+        const std::vector<int> &items = pausePages[pausePage];
+        std::string title = pageTitles[pausePage] ? pageTitles[pausePage] : stem();
+        if ((int)title.size() > COLS - 4) title = title.substr(0, COLS - 4);
+        drawText(1, 0, title, C_HI);
+        for (int k = 0; k < (int)items.size(); k++) {
+            int i = items[k];
             std::string v;
             switch (i) {
             case P_SPEED: snprintf(buf, sizeof buf, "%.2gx%s", cfg.speed, cfg.speed < 1 ? " slow-mo" : cfg.speed > 1 ? " fast" : ""); v = buf; break;
@@ -897,17 +950,23 @@ static void renderMenu() {
             case P_ROOM: v = on(cfg.room) ? "your room" : "dark void"; break;
             case P_STYLE: v = on(cfg.box) ? "pop-up box" : "big screen"; break;
             case P_LOOK: v = on(cfg.popLook) ? "shadows + edges" : "classic"; break;
-            case P_SKY: v = on(cfg.sky) ? "on" : "off (room behind)"; break;
+            case P_SKY: v = on(cfg.sky) ? "on" : "off"; break;
+            case P_TABLE: v = on(cfg.table) ? "on" : "off"; break;
             case P_SIZE: snprintf(buf, sizeof buf, "%.1f m", cfg.screenWidth); v = buf; break;
             case P_DIST: snprintf(buf, sizeof buf, "%.1f m", cfg.distance); v = buf; break;
             }
-            bool sel = i == pauseSel;
-            if (sel) for (int x = 0; x < MENU_W; x++) for (int y = 0; y < CELL_H; y++) menuPixels[((i + 2) * CELL_H + y) * MENU_W + x] = C_SELBG;
-            drawText(2, i + 2, pauseItems[i], sel ? 0xffffffff : C_TEXT);
+            bool sel = k == pauseSel;
+            int y = (k + 2) * CELL_H;
+            if (sel) fillRound(16, y + 1, MENU_W - 32, CELL_H - 2, 10, C_SELBG);
+            drawText(2, k + 2, pauseItems[i], sel ? 0xffffffff : C_TEXT);
             bool arrows = adjustable(i) || toggle(i);
-            if (!v.empty()) drawText(26, i + 2, (arrows ? "< " : "") + v + (arrows ? " >" : ""), sel ? 0xffffffff : C_TEXT);
+            if (!v.empty()) drawText(30, k + 2, (arrows ? "< " : "") + v + (arrows ? " >" : ""), sel ? 0xffffffff : C_HI);
         }
-        drawText(1, ROWS - 1, "L stick: move  R stick: change  A: select  B: resume", C_DIM);
+        if (pausePage == 2) {
+            drawSmall(32, (int)(items.size() + 3) * CELL_H, "Move the game any time: point at the bar under it and hold the trigger.", C_TEXT);
+            drawSmall(32, (int)(items.size() + 3) * CELL_H + 20, "While holding, push the thumbstick up or down to resize it.", C_TEXT);
+        }
+        drawSmall(16, MENU_H - 28, "Point and pull the trigger, or use the sticks and A.   B: back   Left Y: close", C_DIM);
     }
     else if (menuMode == MENU_ABOUT) {
         for (int i = 0; i < ROWS - 1 && aboutTop + i < (int)aboutLines.size(); i++)
@@ -977,14 +1036,15 @@ static XrSession session = XR_NULL_HANDLE;
 static XrSpace localSpace = XR_NULL_HANDLE, viewSpace = XR_NULL_HANDLE;
 static XrSessionState sessionState = XR_SESSION_STATE_UNKNOWN;
 static bool sessionRunning = false, hasRefreshExt = false, hasPassthrough = false;
+static bool hasRoomView() { return hasPassthrough; }
 static XrPassthroughFB passthrough = XR_NULL_HANDLE;
 static XrPassthroughLayerFB passthroughLayer = XR_NULL_HANDLE;
 static bool passthroughRunning = false;
 static Swap menuSwap;
 static XrActionSet actionSet;
 static XrAction actA, actB, actX, actY, actTrigL, actTrigR, actGripL, actGripR, actMenu, actStickL, actStickR, actClickL, actClickR;
-static XrAction actPoseL, actPoseR;
-static XrSpace handSpace[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
+static XrAction actPoseL, actPoseR, actAimL, actAimR;
+static XrSpace handSpace[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE}, aimSpace[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
 static XrPath handL, handR;
 
 static XrPath path(const char *s) { XrPath p; xrStringToPath(instance, s, &p); return p; }
@@ -1070,6 +1130,8 @@ static void initActions() {
     actClickR = makeAction("stick_click_right", XR_ACTION_TYPE_BOOLEAN_INPUT);
     actPoseL = makeAction("hand_left", XR_ACTION_TYPE_POSE_INPUT);
     actPoseR = makeAction("hand_right", XR_ACTION_TYPE_POSE_INPUT);
+    actAimL = makeAction("aim_left", XR_ACTION_TYPE_POSE_INPUT);
+    actAimR = makeAction("aim_right", XR_ACTION_TYPE_POSE_INPUT);
     std::vector<XrActionSuggestedBinding> b = {
         {actA, path("/user/hand/right/input/a/click")},
         {actB, path("/user/hand/right/input/b/click")},
@@ -1086,6 +1148,8 @@ static void initActions() {
         {actClickR, path("/user/hand/right/input/thumbstick/click")},
         {actPoseL, path("/user/hand/left/input/grip/pose")},
         {actPoseR, path("/user/hand/right/input/grip/pose")},
+        {actAimL, path("/user/hand/left/input/aim/pose")},
+        {actAimR, path("/user/hand/right/input/aim/pose")},
     };
     XrInteractionProfileSuggestedBinding sb{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
     sb.interactionProfile = path("/interaction_profiles/oculus/touch_controller");
@@ -1099,6 +1163,8 @@ static void initActions() {
         sci.action = h == 0 ? actPoseL : actPoseR;
         sci.poseInActionSpace.orientation.w = 1;
         XRCHECK(xrCreateActionSpace(session, &sci, &handSpace[h]));
+        sci.action = h == 0 ? actAimL : actAimR;
+        XRCHECK(xrCreateActionSpace(session, &sci, &aimSpace[h]));
     }
 }
 static bool getBool(XrAction a) {
@@ -1347,16 +1413,22 @@ static void menuInput(const bool *b) {
     }
     bool ok = okBtn && !okHeld;
     okHeld = okBtn;
-    if (trigRValue > 0.85f && !trigHeld) ok = true;
-    trigHeld = trigRValue > 0.3f ? (trigHeld || trigRValue > 0.85f) : false;
+    bool pclick = ptr.hover && ptr.click;  // pointer click on the panel
+    ptr.click = false;
     bool back = b[B_A] && !backHeld;
     backHeld = b[B_A];
     if (menuMode == MENU_HELP) {
-        if (ok || back || fire) { menuMode = MENU_NONE; menuDirty = true; }
+        if (ok || back || fire || pclick) { menuMode = MENU_NONE; menuDirty = true; }
         return;
     }
     if (menuMode == MENU_CONTROLS) {
         int rows = N_ACTIONS + 3;
+        if (ptr.hover) {
+            int r = ptr.py / CELL_H - 2;
+            if (r >= N_ACTIONS) r--;  // the gap row before "Applies to"
+            if (r >= 0 && r < rows && r != controlsSel) { controlsSel = r; menuDirty = true; }
+            if (pclick && r >= 0 && r < rows) ok = true;
+        }
         bool clear = b[B_SELECT] && !favHeld;  // left X
         favHeld = b[B_SELECT];
         if (up) controlsSel = (controlsSel + rows - 1) % rows;
@@ -1379,6 +1451,11 @@ static void menuInput(const bool *b) {
         return;
     }
     if (menuMode == MENU_SLOTS) {
+        if (ptr.hover && ptr.py >= 48 && ptr.py < 48 + 2 * 336) {
+            int c = std::clamp((ptr.px - 16) / 504, 0, 1), r = std::clamp((ptr.py - 48) / 336, 0, 1);
+            if (r * 2 + c != slotSel) { slotSel = r * 2 + c; menuDirty = true; }
+            if (pclick) ok = true;
+        }
         if (up || down) slotSel ^= 2;
         if (left || right) slotSel ^= 1;
         if (back) menuMode = MENU_PAUSE;
@@ -1403,6 +1480,17 @@ static void menuInput(const bool *b) {
     if (menuMode == MENU_ROMS) {
         if (roms.empty()) { if (ok) { scanRoms(); buildLibView(); } menuDirty |= ok; return; }
         bool tabL = b[B_L] && !gripHeldL, tabR = b[B_R] && !gripHeldR, fav = b[B_SELECT] && !favHeld;
+        if (ptr.hover && ptr.py < CELL_H && pclick)
+            for (int t = 0; t < TAB_N; t++)
+                if (ptr.px >= tabX0[t] && ptr.px < tabX1[t] && t != libTab) { libTab = t; romSel = 0; buildLibView(); menuDirty = true; }
+        if (ptr.hover && ptr.py >= 40 && ptr.py < 40 + 2 * 336 && !libView.empty()) {
+            int c = std::clamp((ptr.px - 16) / 248, 0, 3), r = (ptr.py - 40) / 336;
+            int idx = (libRow0 + r) * 4 + c;
+            if (idx < (int)libView.size()) {
+                if (idx != romSel) { romSel = idx; menuDirty = true; }
+                if (pclick) ok = true;
+            }
+        }
         gripHeldL = b[B_L]; gripHeldR = b[B_R]; favHeld = b[B_SELECT];
         if (tabL || tabR) { libTab = (libTab + (tabR ? 1 : TAB_N - 1)) % TAB_N; romSel = 0; buildLibView(); }
         int n = (int)libView.size();
@@ -1423,19 +1511,34 @@ static void menuInput(const bool *b) {
         menuDirty |= up || down || left || right || ok || back || tabL || tabR || fav;
         return;
     }
-    // pause menu
-    if (up) pauseSel = (pauseSel + PAUSE_N - 1) % PAUSE_N;
-    if (down) pauseSel = (pauseSel + 1) % PAUSE_N;
+    // pause menu (current page)
+    const std::vector<int> &items = pausePages[pausePage];
+    int n = (int)items.size();
+    pauseSel = std::clamp(pauseSel, 0, n - 1);
+    if (up) pauseSel = (pauseSel + n - 1) % n;
+    if (down) pauseSel = (pauseSel + 1) % n;
     int delta = right ? 1 : left ? -1 : 0;
+    if (ptr.hover) {
+        int k = ptr.py / CELL_H - 2;
+        if (k >= 0 && k < n) {
+            if (k != pauseSel) { pauseSel = k; menuDirty = true; }
+            if (pclick) {
+                int it = items[k];
+                if (adjustable(it)) delta = ptr.px >= 30 * CELL_W + 80 ? 1 : ptr.px >= 30 * CELL_W ? -1 : 1;  // click "<" or ">"
+                else ok = true;
+            }
+        }
+    }
+    int item = items[pauseSel];
     bool changed = false;
-    if (delta || (ok && toggle(pauseSel))) {
+    if ((delta && (adjustable(item) || toggle(item))) || (ok && toggle(item))) {
         changed = true;
-        switch (pauseSel) {
+        switch (item) {
         case P_SPEED: {
             static const float speeds[] = {0.5f, 0.75f, 1.0f, 1.5f, 2.0f};
             int k = 2;
             for (int j = 0; j < 5; j++) if (fabsf(speeds[j] - cfg.speed) < 0.01f) k = j;
-            cfg.speed = speeds[std::clamp(k + delta, 0, 4)];
+            cfg.speed = speeds[std::clamp(k + (delta ? delta : 1), 0, 4)];
             break;
         }
         case P_DEPTH: cfg.strength = std::clamp(cfg.strength + 0.25f * delta, 0.0f, 3.0f); break;
@@ -1447,6 +1550,7 @@ static void menuInput(const bool *b) {
         case P_STYLE: flip(cfg.box); break;
         case P_LOOK: flip(cfg.popLook); break;
         case P_SKY: flip(cfg.sky); break;
+        case P_TABLE: setTabletop(!on(cfg.table)); break;
         case P_SIZE: cfg.screenWidth = std::clamp(cfg.screenWidth + 0.2f * delta, 0.3f, 8.0f); break;
         case P_DIST: {
             cfg.distance = std::clamp(cfg.distance + 0.2f * delta, 0.4f, 8.0f);
@@ -1459,21 +1563,23 @@ static void menuInput(const bool *b) {
         }
         if (changed) { newFrame = frame.valid; saveGlobal(); }  // rebuild the paused frame with the new settings
     }
-    if (ok && !toggle(pauseSel)) {
-        switch (pauseSel) {
+    if (ok && !toggle(item)) {
+        switch (item) {
         case P_RESUME: menuMode = MENU_NONE; break;
         case P_CONTROLS: menuMode = MENU_CONTROLS; controlsSel = 0; break;
-        case P_ARRANGE: menuMode = MENU_ARRANGE; resetMenuInput(); break;
-        case P_RESET: defaultPlacement(); saveGlobal(); showToast("Position reset"); break;
+        case P_RESET: defaultPlacement(); saveGlobal(); showToast("Moved in front of you"); break;
         case P_SAVE: menuMode = MENU_SLOTS; slotSaving = true; break;
         case P_LOAD: menuMode = MENU_SLOTS; slotSaving = false; break;
         case P_SHOT: takeScreenshot(); break;
         case P_CLIP: saveClip(); break;
-        case P_GAMES: scanRoms(); saveStats(); buildLibView(); menuMode = MENU_ROMS; break;
+        case P_GAMES: scanRoms(); saveStats(); buildLibView(); menuMode = MENU_ROMS; placeMenu(); break;
         case P_ABOUT: menuMode = MENU_ABOUT; aboutTop = 0; break;
+        case P_PAGE_PICTURE: pausePage = 1; pauseSel = 1; break;
+        case P_PAGE_ROOM: pausePage = 2; pauseSel = 1; break;
+        case P_BACK: pausePage = 0; pauseSel = 0; break;
         }
     }
-    if (back) menuMode = MENU_NONE;
+    if (back) { if (pausePage) { pausePage = 0; pauseSel = 0; } else menuMode = MENU_NONE; }
     menuDirty |= up || down || delta || ok || back || changed;
 }
 
@@ -1548,6 +1654,148 @@ static void arrangeUpdate(XrTime t) {
         cfg.qx = nr.x; cfg.qy = nr.y; cfg.qz = nr.z; cfg.qw = nr.w;
     }
     cfg.distance = std::clamp(sqrtf(cfg.px * cfg.px + cfg.py * cfg.py + cfg.pz * cfg.pz), 0.4f, 8.0f);
+}
+
+// ---------------------------------------------------------------- pointing: menus and the grab bar
+// Each controller casts a ray. On a menu it hovers and clicks (trigger). While playing, pointing at the
+// bar under the game and holding the trigger carries the game; the thumbstick resizes it meanwhile.
+static XrVector3f menuPos{0, 0, -1.4f};
+static Quat menuRot{0, 0, 0, 1};
+static const float MENU_WM = 1.2f, MENU_HM = 1.2f * MENU_H / MENU_W;
+static void placeMenu() {  // in front of where you are looking
+    float fx, fz; yawFwd(fx, fz);
+    menuPos = {headX + fx * 1.3f, headY - 0.08f, headZ + fz * 1.3f};
+    menuRot = {0, sinf(headYaw / 2), 0, cosf(headYaw / 2)};
+}
+static int pointHand = 1;                     // hand that last clicked (right by default)
+static float trigPrev[2] = {0, 0};
+static int grabHand = -1;                      // hand carrying the game by its bar
+static XrPosef grabStart;
+static XrVector3f grabPos0; static Quat grabRot0;
+static bool barHover[2] = {false, false};
+
+static XrVector3f v3(float x, float y, float z) { return {x, y, z}; }
+static XrVector3f vadd(XrVector3f a, XrVector3f b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
+static XrVector3f vsub(XrVector3f a, XrVector3f b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+static XrVector3f vmul(XrVector3f a, float k) { return {a.x * k, a.y * k, a.z * k}; }
+static float vdot(XrVector3f a, XrVector3f b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+static XrVector3f vcross(XrVector3f a, XrVector3f b) { return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; }
+static XrVector3f vnorm(XrVector3f a) { float n = sqrtf(vdot(a, a)); return n > 1e-6f ? vmul(a, 1 / n) : v3(0, 0, -1); }
+
+// ray against a rectangle in a frame (pos, rot); returns local x, y on hit
+static bool rayRect(XrVector3f o, XrVector3f d, XrVector3f pos, Quat rot, float hw, float hh, float &lx, float &ly, float &t) {
+    Quat inv = qconj(rot);
+    XrVector3f lo = qrot(inv, vsub(o, pos)), ld = qrot(inv, d);
+    if (ld.z > -1e-4f && ld.z < 1e-4f) return false;
+    t = -lo.z / ld.z;
+    if (t <= 0) return false;
+    lx = lo.x + ld.x * t; ly = lo.y + ld.y * t;
+    return fabsf(lx) <= hw && fabsf(ly) <= hh;
+}
+static void addRay(XrVector3f o, XrVector3f d, float len, const float *col) {
+    XrVector3f e = vadd(o, vmul(d, len));
+    XrVector3f side = vmul(vnorm(vcross(d, fabsf(d.y) > 0.9f ? v3(1, 0, 0) : v3(0, 1, 0))), 0.0018f);
+    render::FlatShape sh;
+    XrVector3f a = vsub(o, side), b = vadd(o, side), c = vadd(e, side), f = vsub(e, side);
+    sh.tris = {a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z, a.x, a.y, a.z, c.x, c.y, c.z, f.x, f.y, f.z};
+    memcpy(sh.color, col, 16);
+    renderer.shapes.push_back(sh);
+}
+// the bar sits centred under the game's front plane
+static void barFrame(XrVector3f &pos, Quat &rot, float &hw, float &hh) {
+    rot = qnorm({cfg.qx, cfg.qy, cfg.qz, cfg.qw});
+    float W = cfg.screenWidth, H = W * 3.0f / 4.0f;
+    hw = std::clamp(0.3f * W, 0.12f, 0.6f) / 2;
+    hh = std::clamp(0.03f * W, 0.012f, 0.05f) / 2;
+    float gap = 0.02f + 0.02f * W;
+    pos = vadd(v3(cfg.px, cfg.py, cfg.pz), qrot(rot, v3(0, -H / 2 - gap - hh, 0.004f)));
+}
+static void pointerUpdate(XrTime t) {
+    XrVector3f org[2], dir[2]; bool valid[2];
+    Quat aq[2];
+    for (int h = 0; h < 2; h++) {
+        XrSpaceLocation loc{XR_TYPE_SPACE_LOCATION};
+        valid[h] = aimSpace[h] && XR_SUCCEEDED(xrLocateSpace(aimSpace[h], localSpace, t, &loc)) &&
+                   (loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) && (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT);
+        if (!valid[h]) continue;
+        aq[h] = {loc.pose.orientation.x, loc.pose.orientation.y, loc.pose.orientation.z, loc.pose.orientation.w};
+        org[h] = loc.pose.position;
+        dir[h] = qrot(aq[h], v3(0, 0, -1));
+    }
+    float tv[2] = {getFloat(actTrigL), getFloat(actTrigR)};
+    bool pressed[2], released[2];
+    for (int h = 0; h < 2; h++) { pressed[h] = tv[h] > 0.7f && trigPrev[h] <= 0.7f; released[h] = tv[h] < 0.3f; trigPrev[h] = tv[h]; }
+    static const float rayCol[4] = {0.85f, 0.92f, 1.0f, 1.0f}, rayDim[4] = {0.45f, 0.5f, 0.6f, 1.0f};
+
+    if (menuMode != MENU_NONE && menuMode != MENU_ARRANGE) {
+        bool hit[2] = {false, false}; float lx[2], ly[2], tt[2];
+        for (int h = 0; h < 2; h++)
+            if (valid[h]) hit[h] = rayRect(org[h], dir[h], menuPos, menuRot, MENU_WM / 2, MENU_HM / 2, lx[h], ly[h], tt[h]);
+        for (int h = 0; h < 2; h++) if (pressed[h] && hit[h]) pointHand = h;
+        if (!hit[pointHand] && hit[1 - pointHand]) pointHand = 1 - pointHand;
+        int h = pointHand;
+        ptr.hover = hit[h];
+        if (hit[h]) {
+            int px = (int)((lx[h] / MENU_WM + 0.5f) * MENU_W), py = (int)((0.5f - ly[h] / MENU_HM) * MENU_H);
+            if (px != ptr.px || py != ptr.py) { ptr.px = px; ptr.py = py; }
+            if (pressed[h]) ptr.click = true;
+        }
+        for (int k = 0; k < 2; k++)
+            if (valid[k]) addRay(org[k], dir[k], hit[k] ? tt[k] : 1.5f, k == h && hit[k] ? rayCol : rayDim);
+        return;
+    }
+    ptr.hover = false;
+    if (!gameLoaded || menuMode == MENU_ARRANGE) return;
+    // the grab bar
+    XrVector3f bp; Quat br; float hw, hh;
+    barFrame(bp, br, hw, hh);
+    float bt[2];
+    for (int h = 0; h < 2; h++) {
+        float lx, ly;
+        barHover[h] = valid[h] && rayRect(org[h], dir[h], bp, br, hw * 1.6f, hh * 3.0f, lx, ly, bt[h]);
+        if (barHover[h] && pressed[h] && grabHand < 0) {
+            grabHand = h;
+            grabStart.position = org[h];
+            grabStart.orientation = {aq[h].x, aq[h].y, aq[h].z, aq[h].w};
+            grabPos0 = v3(cfg.px, cfg.py, cfg.pz);
+            grabRot0 = qnorm({cfg.qx, cfg.qy, cfg.qz, cfg.qw});
+        }
+    }
+    if (grabHand >= 0) {
+        int h = grabHand;
+        if (!valid[h] || released[h]) {
+            grabHand = -1;
+            cfg.table = cfg.table;  // keep the mode; only the placement changed
+            cfg.distance = std::clamp(sqrtf((cfg.px - headX) * (cfg.px - headX) + (cfg.pz - headZ) * (cfg.pz - headZ)), 0.4f, 8.0f);
+            saveGlobal();
+        } else {
+            // carry: the game keeps its offset and turns with the controller
+            Quat qs = {grabStart.orientation.x, grabStart.orientation.y, grabStart.orientation.z, grabStart.orientation.w};
+            Quat dq = qnorm(qmul(aq[h], qconj(qs)));
+            XrVector3f r = qrot(dq, vsub(grabPos0, grabStart.position));
+            cfg.px = org[h].x + r.x; cfg.py = org[h].y + r.y; cfg.pz = org[h].z + r.z;
+            Quat nr = qnorm(qmul(dq, grabRot0));
+            cfg.qx = nr.x; cfg.qy = nr.y; cfg.qz = nr.z; cfg.qw = nr.w;
+            // the stick of the carrying hand resizes
+            XrVector2f st = getStick(h == 0 ? actStickL : actStickR);
+            if (fabsf(st.y) > 0.3f) cfg.screenWidth = std::clamp(cfg.screenWidth * (1.0f + 0.015f * st.y), 0.3f, 8.0f);
+            stickX = stickY = 0;  // the game does not see this stick while carrying
+        }
+    }
+    // the trigger used on the bar does not reach the game
+    for (int h = 0; h < 2; h++)
+        if (barHover[h] || grabHand == h) physDown[h == 0 ? PH_LTRIG : PH_RTRIG] = false;
+    // draw the bar (and the ray of a hand pointing at it)
+    static const float barIdle[4] = {0.42f, 0.44f, 0.5f, 1}, barLit[4] = {0.55f, 0.75f, 1.0f, 1}, barHeld[4] = {0.3f, 0.6f, 1.0f, 1};
+    render::FlatShape sh;
+    XrVector3f c[4] = {vadd(bp, qrot(br, v3(-hw, -hh, 0))), vadd(bp, qrot(br, v3(hw, -hh, 0))),
+                       vadd(bp, qrot(br, v3(hw, hh, 0))), vadd(bp, qrot(br, v3(-hw, hh, 0)))};
+    sh.tris = {c[0].x, c[0].y, c[0].z, c[1].x, c[1].y, c[1].z, c[2].x, c[2].y, c[2].z,
+               c[0].x, c[0].y, c[0].z, c[2].x, c[2].y, c[2].z, c[3].x, c[3].y, c[3].z};
+    memcpy(sh.color, grabHand >= 0 ? barHeld : (barHover[0] || barHover[1]) ? barLit : barIdle, 16);
+    renderer.shapes.push_back(sh);
+    for (int h = 0; h < 2; h++)
+        if (valid[h] && (barHover[h] || grabHand == h)) addRay(org[h], dir[h], grabHand == h ? 0.25f : bt[h], rayCol);
 }
 
 // ---------------------------------------------------------------- main
@@ -1672,7 +1920,8 @@ void android_main(android_app *app) {
                     if (!req.empty() && req[0] >= '0' && req[0] <= '2') libTab = req[0] - '0';
                     if (!req.empty() && req[0] == 'c') show = MENU_CONTROLS;
                     if (!req.empty() && req[0] == 'h') show = MENU_HELP;
-                    if (req.size() > 2) { romSel = atoi((const char *)req.data() + 2); controlsSel = romSel; }
+                    if (!req.empty() && (req[0] == 'p' || req[0] == 'q' || req[0] == 'r')) { show = MENU_PAUSE; pausePage = req[0] - 'p'; }
+                    if (req.size() > 2) { romSel = atoi((const char *)req.data() + 2); controlsSel = romSel; pauseSel = romSel; }
                     menuMode = show; buildLibView(); renderMenu();
                     std::vector<uint8_t> rgb(MENU_W * MENU_H * 3);
                     for (int i = 0; i < MENU_W * MENU_H; i++) { uint32_t c = menuPixels[i]; rgb[i * 3] = c & 255; rgb[i * 3 + 1] = (c >> 8) & 255; rgb[i * 3 + 2] = (c >> 16) & 255; }
@@ -1712,6 +1961,20 @@ void android_main(android_app *app) {
         xrBeginFrame(session, &fbi);
 
         pollActions();
+        {   // head pose for menus and placement presets
+            XrSpaceLocation hl{XR_TYPE_SPACE_LOCATION};
+            if (XR_SUCCEEDED(xrLocateSpace(viewSpace, localSpace, fs.predictedDisplayTime, &hl)) &&
+                (hl.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)) {
+                headX = hl.pose.position.x; headY = hl.pose.position.y; headZ = hl.pose.position.z;
+                Quat hq{hl.pose.orientation.x, hl.pose.orientation.y, hl.pose.orientation.z, hl.pose.orientation.w};
+                XrVector3f f = qrot(hq, v3(0, 0, -1));
+                headYaw = atan2f(-f.x, -f.z);
+            }
+            static bool placedOnce = false;
+            if (!placedOnce) { placeMenu(); placedOnce = true; }
+        }
+        renderer.shapes.clear();
+        pointerUpdate(fs.predictedDisplayTime);
         bool all[B_COUNT], nav[B_COUNT], wantRewind, wantFast;
         gameButtons(all, wantRewind, wantFast);
         menuButtons(nav);
@@ -1736,7 +1999,7 @@ void android_main(android_app *app) {
         bool menuEdge = menuBtn && !prevMenuBtn;
         if (menuEdge && remapAction >= 0) { remapAction = -1; menuDirty = true; menuEdge = false; }  // cancels a remap
         if (menuEdge) {
-            if (menuMode == MENU_NONE) { menuMode = MENU_PAUSE; pauseSel = 0; saveSram(); }
+            if (menuMode == MENU_NONE) { menuMode = MENU_PAUSE; pausePage = 0; pauseSel = 0; saveSram(); placeMenu(); }
             else if (gameLoaded) { menuMode = MENU_NONE; saveGlobal(); saveSettings(saveDir + "/" + stem() + ".cfg", false); }
             menuDirty = true;
             resetMenuInput();  // swallow whatever is held when the menu opens
@@ -1921,9 +2184,11 @@ void android_main(android_app *app) {
             } else if (menuMode == MENU_ARRANGE) {  // small hint card low in view, out of the way of the game
                 q.pose.position = {0.0f, -0.55f, -1.0f};
                 q.size = {0.6f, 0.6f * MENU_H / MENU_W};
-            } else {
-                q.pose.position = {0.0f, 0.0f, -1.4f};
-                q.size = {1.2f, 1.2f * MENU_H / MENU_W};
+            } else {  // the menu panel, placed in front of you when it opened
+                q.pose.position = menuPos;
+                q.pose.orientation = {menuRot.x, menuRot.y, menuRot.z, menuRot.w};
+                q.size = {MENU_WM, MENU_HM};
+                q.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;  // rounded corners
             }
             layers[nl] = (XrCompositionLayerBaseHeader *)&q;
             nl++;

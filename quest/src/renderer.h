@@ -71,6 +71,21 @@ void main() {
 }
 )";
 
+// flat-colour geometry (pointer rays, the grab bar) in room coordinates
+static const char *kFlatVS = R"(#version 300 es
+layout(location = 0) in vec3 aPos;
+uniform mat4 uViewProj;
+void main() { gl_Position = uViewProj * vec4(aPos, 1.0); }
+)";
+static const char *kFlatFS = R"(#version 300 es
+precision mediump float;
+uniform vec4 uColor;
+out vec4 oColor;
+void main() { oColor = uColor; }
+)";
+
+struct FlatShape { std::vector<float> tris; float color[4]; };  // x y z per vertex, triangles
+
 struct Eye {
     XrSwapchain swap = XR_NULL_HANDLE;
     int w = 0, h = 0;
@@ -83,6 +98,9 @@ struct Renderer {
     GLuint prog = 0, tex = 0, vao = 0, vbo = 0, ibo = 0, map = 0;
     GLint uViewProj, uScreen, uDepth, uFrame, uTex, uModel, uStyle, uMap, uHaze;
     float haze = 0.0f;
+    GLuint flatProg = 0, flatVao = 0, flatVbo = 0;
+    GLint fViewProj = -1, fColor = -1;
+    std::vector<FlatShape> shapes;  // drawn after the sheets each frame
     int indexCount = 0;
     float frameW = 256, frameH = 224;
     Eye eyes[2];
@@ -101,6 +119,18 @@ struct Renderer {
         GLint ok = 0; glGetProgramiv(prog, GL_LINK_STATUS, &ok);
         if (!ok) return false;
         uViewProj = glGetUniformLocation(prog, "uViewProj");
+        flatProg = glCreateProgram();
+        glAttachShader(flatProg, compile(GL_VERTEX_SHADER, kFlatVS));
+        glAttachShader(flatProg, compile(GL_FRAGMENT_SHADER, kFlatFS));
+        glLinkProgram(flatProg);
+        fViewProj = glGetUniformLocation(flatProg, "uViewProj");
+        fColor = glGetUniformLocation(flatProg, "uColor");
+        glGenVertexArrays(1, &flatVao);
+        glGenBuffers(1, &flatVbo);
+        glBindVertexArray(flatVao);
+        glBindBuffer(GL_ARRAY_BUFFER, flatVbo);
+        glEnableVertexAttribArray(0); glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 12, (void *)0);
+        glBindVertexArray(0);
         uScreen = glGetUniformLocation(prog, "uScreen");
         uDepth = glGetUniformLocation(prog, "uDepth");
         uFrame = glGetUniformLocation(prog, "uFrame");
@@ -242,6 +272,22 @@ struct Renderer {
             glActiveTexture(GL_TEXTURE0);
             glBindVertexArray(vao);
             glDrawElements(GL_TRIANGLES, indexCount, GL_UNSIGNED_INT, nullptr);
+            glBindVertexArray(0);
+        }
+        if (!shapes.empty()) {  // pointer rays and the grab bar, in room space
+            float m[16];
+            viewProj(view.pose, view.fov, m);
+            glEnable(GL_DEPTH_TEST);
+            glDepthFunc(GL_LEQUAL);
+            glUseProgram(flatProg);
+            glUniformMatrix4fv(fViewProj, 1, GL_FALSE, m);
+            glBindVertexArray(flatVao);
+            glBindBuffer(GL_ARRAY_BUFFER, flatVbo);
+            for (const auto &sh : shapes) {
+                glBufferData(GL_ARRAY_BUFFER, sh.tris.size() * 4, sh.tris.data(), GL_STREAM_DRAW);
+                glUniform4fv(fColor, 1, sh.color);
+                glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(sh.tris.size() / 3));
+            }
             glBindVertexArray(0);
         }
         const GLenum discardDepth = GL_DEPTH_ATTACHMENT;
