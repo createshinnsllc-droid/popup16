@@ -10,3 +10,5 @@ quest/third_party/oxr/
 .DS_Store
 # generated from license files by tools/make_notices.py during the APK build
 quest/assets/NOTICES.txt
+# isolated modernization verification homes, logs, binaries and generated fixtures
+/test/output/

@@ -16,6 +16,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "../../shared/frame_shape.h"
 
 namespace capture {
 
@@ -169,6 +170,20 @@ private:
 #define CLOG(...) __android_log_print(ANDROID_LOG_INFO, "PopUp16clip", __VA_ARGS__)
         CLOG("encode: %zu frames, %zu audio samples -> %s", frames.size(), audioPcm.size() / 2, path.c_str());
         if (frames.empty()) { msg = "Nothing to save yet"; return false; }
+        // The encoder and the NV12 buffer below are sized from the first frame, so every later frame
+        // must match it. A resolution change mid-recording (hires mode, a game switch) could otherwise
+        // write past the end of that buffer; refuse the clip and say why instead. The rule itself lives
+        // in shared/frame_shape.h so it can be unit tested without Android codecs.
+        if (!frames::allMatchFirst(frames)) {
+            for (const auto &fr : frames)
+                if (fr.w != frames.front().w || fr.h != frames.front().h) {
+                    CLOG("refusing to encode: frame %ux%u does not match the %ux%u encoder",
+                         fr.w, fr.h, frames.front().w, frames.front().h);
+                    break;
+                }
+            msg = "Clip skipped: the picture size changed while recording";
+            return false;
+        }
         const int S = 2;  // 2x pixels: 512x448 for a 256x224 game
         const int W = frames.front().w * S, H = frames.front().h * S;
         const int EW = (W + 15) & ~15, EH = (H + 15) & ~15;

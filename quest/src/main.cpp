@@ -44,7 +44,17 @@
 #include "renderer.h"
 #include "../../shared/rewind.h"
 #include "../../shared/png.h"
+#include "../../shared/place_geometry.h"
 #include "capture.h"
+
+// Developer test hooks (files/autostart.txt, files/debug_headless, the *_request files) are compiled
+// out unless a build explicitly opts in with -DPOPUP16_DEV_HOOKS=1, so a shipped APK cannot be
+// driven by files someone drops into its data folder.
+#ifdef POPUP16_DEV_HOOKS
+static constexpr bool kDevHooks = true;
+#else
+static constexpr bool kDevHooks = false;
+#endif
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "PopUp16", __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "PopUp16", __VA_ARGS__)
@@ -81,6 +91,9 @@ struct Settings {
     // global: how and where the diorama sits in the room
     float screenWidth = 2.4f, distance = 2.2f, room = 0, box = 0, popLook = 1, sky = 1, speed = 1, table = 0;
     float px = 0, py = 0, pz = -2.2f, qx = 0, qy = 0, qz = 0, qw = 1;
+    // the viewer position the screen was placed for; window/box depth is measured from here rather
+    // than from the LOCAL origin, so a recenter or a different chair cannot leave it stale
+    float seatX = 0, seatY = 0, seatZ = 0, seatMarked = 0;
 };
 static Settings cfg;
 static std::string filesDir, romDir, saveDir, sysDir;
@@ -92,15 +105,21 @@ static const struct { const char *name; float Settings::*field; bool global; } k
     {"popLook", &Settings::popLook, true}, {"sky", &Settings::sky, true}, {"speed", &Settings::speed, true}, {"table", &Settings::table, true},
     {"px", &Settings::px, true}, {"py", &Settings::py, true}, {"pz", &Settings::pz, true},
     {"qx", &Settings::qx, true}, {"qy", &Settings::qy, true}, {"qz", &Settings::qz, true}, {"qw", &Settings::qw, true},
+    {"seatX", &Settings::seatX, true}, {"seatY", &Settings::seatY, true}, {"seatZ", &Settings::seatZ, true},
+    {"seatMarked", &Settings::seatMarked, true},
 };
 static bool on(float v) { return v > 0.5f; }
 static void flip(float &v) { v = on(v) ? 0.0f : 1.0f; }
 
-static void saveSettings(const std::string &path, bool global) {
-    FILE *f = fopen(path.c_str(), "w");
-    if (!f) return;
-    for (auto &k : kFields) if (k.global == global) fprintf(f, "%s=%g\n", k.name, cfg.*k.field);
-    fclose(f);
+// defined below; declared here because settings are written before it appears
+static bool writeFileAtomic(const std::string &p, const void *d, size_t n);
+
+static bool saveSettings(const std::string &path, bool global) {
+    std::string text;
+    char line[96];
+    for (auto &k : kFields) if (k.global == global) { snprintf(line, sizeof line, "%s=%g\n", k.name, cfg.*k.field); text += line; }
+    if (text.empty()) return true;                  // nothing belongs in this file; leave any existing one alone
+    return writeFileAtomic(path, text.data(), text.size());
 }
 static void loadSettings(const std::string &path, bool global) {
     FILE *f = fopen(path.c_str(), "r");
@@ -116,7 +135,8 @@ static void saveGlobal() { saveSettings(filesDir + "/settings.cfg", true); }
 struct GameStats { double seconds = 0; long lastPlayed = 0; bool fav = false; };
 static std::map<std::string, GameStats> stats;  // by ROM file name
 static std::string coverDir;
-static void saveStats();
+static bool saveStats();
+static void showToast(const std::string &t);
 
 static bool readFile(const std::string &p, std::vector<uint8_t> &out) {
     FILE *f = fopen(p.c_str(), "rb");
@@ -127,9 +147,29 @@ static bool readFile(const std::string &p, std::vector<uint8_t> &out) {
     fclose(f);
     return ok;
 }
-static void writeFile(const std::string &p, const void *d, size_t n) {
+static bool writeFile(const std::string &p, const void *d, size_t n) {
     FILE *f = fopen(p.c_str(), "wb");
-    if (f) { fwrite(d, 1, n, f); fclose(f); }
+    if (!f) return false;
+    bool ok = fwrite(d, 1, n, f) == n;
+    if (fclose(f) != 0) ok = false;
+    return ok;
+}
+// Crash-safe, checked write for anything the user would hate to lose: the data goes to a temporary
+// file beside the destination, is flushed all the way to disk, and only then replaces the old file.
+// A failure (full disk, bad permissions, interrupted write) leaves the previous good file intact and
+// reports false, so callers can tell the user the truth instead of claiming success.
+static bool writeFileAtomic(const std::string &p, const void *d, size_t n) {
+    if (n == 0) return false;                       // never replace a good file with nothing
+    std::string tmp = p + ".tmp";
+    FILE *f = fopen(tmp.c_str(), "wb");
+    if (!f) { LOGE("cannot open %s for writing", tmp.c_str()); return false; }
+    bool ok = fwrite(d, 1, n, f) == n;
+    if (ok && fflush(f) != 0) ok = false;
+    if (ok && fsync(fileno(f)) != 0) ok = false;
+    if (fclose(f) != 0) ok = false;
+    if (!ok) { remove(tmp.c_str()); LOGE("write failed for %s", p.c_str()); return false; }
+    if (rename(tmp.c_str(), p.c_str()) != 0) { remove(tmp.c_str()); LOGE("replacing %s failed", p.c_str()); return false; }
+    return true;
 }
 
 // ---------------------------------------------------------------- audio
@@ -425,17 +465,24 @@ static std::string controlsPath(bool perGame) {
 static void saveSram() {
     if (!gameLoaded) return;
     size_t n = retro_get_memory_size(RETRO_MEMORY_SAVE_RAM);
-    if (n) writeFile(saveDir + "/" + stem() + ".srm", retro_get_memory_data(RETRO_MEMORY_SAVE_RAM), n);
+    // In-game progress: a failed write has to be visible, not silently swallowed.
+    if (n && !writeFileAtomic(saveDir + "/" + stem() + ".srm", retro_get_memory_data(RETRO_MEMORY_SAVE_RAM), n)) {
+        LOGE("battery save failed for %s", stem().c_str());
+        showToast("Could not save game progress");
+    }
 }
 // quick resume: the running game's state and name are saved whenever the app may go away
 static void saveResume() {
     if (!gameLoaded) return;
     saveStats();
     std::vector<uint8_t> s(retro_serialize_size());
-    if (!s.empty() && retro_serialize(s.data(), s.size())) {
-        writeFile(saveDir + "/" + stem() + ".resume", s.data(), s.size());
-        writeFile(filesDir + "/last_game.txt", gameName.data(), gameName.size());
-    }
+    if (s.empty() || !retro_serialize(s.data(), s.size())) { LOGE("could not serialize %s for resume", gameName.c_str()); return; }
+    // Point last_game.txt at this game only after its state is safely on disk, so a failed save can
+    // never send the next launch into a missing or stale snapshot.
+    if (writeFileAtomic(saveDir + "/" + stem() + ".resume", s.data(), s.size()))
+        writeFileAtomic(filesDir + "/last_game.txt", gameName.data(), gameName.size());
+    else
+        LOGE("resume save failed for %s", stem().c_str());
 }
 static void periodicResumeSave() {  // crash safety while playing
     static double next = nowSec() + 60;
@@ -618,11 +665,15 @@ static void loadStats() {
     }
     fclose(f);
 }
-static void saveStats() {
-    FILE *f = fopen((filesDir + "/library.cfg").c_str(), "w");
-    if (!f) return;
-    for (auto &[n, g] : stats) fprintf(f, "%s\t%.0f\t%ld\t%d\n", n.c_str(), g.seconds, g.lastPlayed, g.fav ? 1 : 0);
-    fclose(f);
+static bool saveStats() {
+    if (stats.empty()) return true;                 // nothing loaded yet: keep the existing library as it is
+    std::string text;
+    char line[512];
+    for (auto &[n, g] : stats) {
+        snprintf(line, sizeof line, "%s\t%.0f\t%ld\t%d\n", n.c_str(), g.seconds, g.lastPlayed, g.fav ? 1 : 0);
+        text += line;
+    }
+    return writeFileAtomic(filesDir + "/library.cfg", text.data(), text.size());
 }
 static std::string playtimeText(double sec) {
     char b[32];
@@ -655,15 +706,25 @@ static const std::vector<uint32_t> *cover(const std::string &rom) {
         if (!readFile(coverDir + "/" + stemName + ext, data)) continue;
         AImageDecoder *dec = nullptr;
         if (AImageDecoder_createFromBuffer(data.data(), data.size(), &dec) != ANDROID_IMAGE_DECODER_SUCCESS) continue;
+        // Show the art at its own aspect ratio. Decoding straight to the card size squashed every
+        // cover whose shape was not exactly 224x196, which distorted titles and faces. The image is
+        // scaled to fit the card instead and centred, with warm bars filling the difference.
+        const AImageDecoderHeaderInfo *hdr = AImageDecoder_getHeaderInfo(dec);
+        const int srcW = (int)AImageDecoderHeaderInfo_getWidth(hdr);
+        const int srcH = (int)AImageDecoderHeaderInfo_getHeight(hdr);
+        const place::Size fit = place::fitInside({srcW, srcH}, {CARD_W, CARD_H});
+        if (fit.w <= 0 || fit.h <= 0) { AImageDecoder_delete(dec); continue; }
+        const place::Size at = place::centreInside(fit, {CARD_W, CARD_H});
         AImageDecoder_setAndroidBitmapFormat(dec, ANDROID_BITMAP_FORMAT_RGBA_8888);
-        AImageDecoder_setTargetSize(dec, CARD_W, CARD_H);
+        AImageDecoder_setTargetSize(dec, fit.w, fit.h);
         size_t stride = AImageDecoder_getMinimumStride(dec);
-        std::vector<uint8_t> buf(stride * CARD_H);
+        std::vector<uint8_t> buf(stride * (size_t)fit.h);
         bool ok = AImageDecoder_decodeImage(dec, buf.data(), stride, buf.size()) == ANDROID_IMAGE_DECODER_SUCCESS;
         AImageDecoder_delete(dec);
         if (!ok) continue;
-        px.resize(CARD_W * CARD_H);
-        for (int y = 0; y < CARD_H; y++) memcpy(&px[y * CARD_W], &buf[y * stride], CARD_W * 4);
+        px.assign((size_t)CARD_W * CARD_H, 0xff3a2a20u);  // same warm tone as a card with no art
+        for (int y = 0; y < fit.h; y++)
+            memcpy(&px[(size_t)(at.h + y) * CARD_W + at.w], &buf[(size_t)y * stride], (size_t)fit.w * 4);
         for (auto &c : px) c |= 0xff000000u;
         return &px;
     }
@@ -765,17 +826,18 @@ static const uint32_t C_BG = 0xff201812, C_TEXT = 0xffe0e0e0, C_DIM = 0xff909090
 
 enum PauseItem { P_RESUME, P_CONTROLS, P_SPEED, P_DEPTH, P_CONV, P_3D, P_MODE7, P_SWAP, P_ROOM, P_STYLE, P_LOOK, P_SKY,
                  P_TABLE, P_RESET, P_SIZE, P_DIST, P_SAVE, P_LOAD, P_SHOT, P_CLIP, P_GAMES, P_ABOUT,
-                 P_PAGE_PICTURE, P_PAGE_ROOM, P_BACK, P_HANG, PAUSE_N };
+                 P_PAGE_PICTURE, P_PAGE_ROOM, P_BACK, P_SEAT, P_HANG, PAUSE_N };
 static const char *pauseItems[PAUSE_N] = {
     "Resume", "Controls & remapping", "Game speed", "3D depth", "Convergence", "3D on/off", "Mode 7 floor depth", "Swap eyes",
     "Surroundings", "3D style", "Pop-up look", "Show sky", "Tabletop mode", "Bring it in front of me",
     "Screen size", "Screen distance", "Save state", "Load state", "Take screenshot", "Save last 30 s as video",
-    "Choose game", "About & licenses", "Picture & 3D  >", "Room & placement  >", "<  Back", "Hang it on the wall"};
+    "Choose game", "About & licenses", "Picture & 3D  >", "Room & placement  >", "<  Back",
+    "This is my seat", "Hang it on the wall"};
 // the pause menu is three short pages instead of one long list
 static const std::vector<int> pausePages[3] = {
     {P_RESUME, P_GAMES, P_SAVE, P_LOAD, P_SHOT, P_CLIP, P_PAGE_PICTURE, P_PAGE_ROOM, P_CONTROLS, P_ABOUT},
     {P_BACK, P_DEPTH, P_CONV, P_3D, P_LOOK, P_MODE7, P_SWAP, P_SPEED},
-    {P_BACK, P_HANG, P_TABLE, P_ROOM, P_SKY, P_STYLE, P_SIZE, P_DIST, P_RESET}};
+    {P_BACK, P_HANG, P_SEAT, P_TABLE, P_ROOM, P_SKY, P_STYLE, P_SIZE, P_DIST, P_RESET}};
 static const char *pageTitles[3] = {nullptr, "Picture & 3D", "Room & placement"};
 static int pausePage = 0;
 static bool adjustable(int i) { return i == P_SPEED || i == P_DEPTH || i == P_CONV || i == P_SIZE || i == P_DIST; }
@@ -784,6 +846,23 @@ static bool toggle(int i) { return i == P_3D || i == P_MODE7 || i == P_SWAP || i
 static float headX = 0, headY = 0, headZ = 0, headYaw = 0;
 static void yawFwd(float &fx, float &fz) { fx = -sinf(headYaw); fz = -cosf(headYaw); }
 static void placeMenu();
+// How far the game sits from the viewer it was placed for. Before the seat is marked this is the
+// distance from the LOCAL origin, which is exactly the previous behaviour.
+static float placementDepth() {
+    const place::Vec3 seat = on(cfg.seatMarked) ? place::Vec3{cfg.seatX, cfg.seatY, cfg.seatZ} : place::Vec3{0, 0, 0};
+    return place::seatDepth(place::Vec3{cfg.px, cfg.py, cfg.pz}, seat, 0.4f);
+}
+// Remember where the viewer actually is. Called when the screen is placed or re-placed, and from
+// the menu, so window depth follows the person instead of the room they first launched the app in.
+static void markSeatHere() {
+    cfg.seatX = headX; cfg.seatY = headY; cfg.seatZ = headZ; cfg.seatMarked = 1;
+}
+static void markSeatAndTell() {
+    markSeatHere();
+    saveGlobal();
+    showToast("Seat marked: picture depth is measured from here now");
+    trace("seat marked at %.2f %.2f %.2f", cfg.seatX, cfg.seatY, cfg.seatZ);
+}
 static void defaultPlacement() {  // straight ahead of where you are looking, upright
     float fx, fz; yawFwd(fx, fz);
     cfg.px = headX + fx * cfg.distance; cfg.py = headY; cfg.pz = headZ + fz * cfg.distance;
@@ -797,6 +876,7 @@ static void setTabletop(bool want) {
         cfg.table = 1; cfg.box = 1; cfg.sky = 0; cfg.popLook = 1;
         if (hasRoomView()) cfg.room = 1;
         cfg.screenWidth = 0.7f;
+        markSeatHere();  // the tabletop is sized for the seat you are in right now
         cfg.px = headX + fx * 0.65f; cfg.py = headY - 0.40f; cfg.pz = headZ + fz * 0.65f;
         // face you, leaning back a little like a book propped open
         float yq = sinf(headYaw / 2), yw = cosf(headYaw / 2), t = -0.26f / 2;  // -15 degrees about x
@@ -815,13 +895,13 @@ static void showToast(const std::string &t);
 static std::string slotPath(int n) { return saveDir + "/" + stem() + (n == 0 ? ".state" : ".slot" + std::to_string(n + 1) + ".state"); }
 static void saveSlot(int n) {
     std::vector<uint8_t> st(retro_serialize_size());
-    if (st.empty() || !retro_serialize(st.data(), st.size())) { showToast("Could not save"); return; }
-    writeFile(slotPath(n), st.data(), st.size());
-    if (frame.valid) {
+    if (st.empty() || !retro_serialize(st.data(), st.size())) { showToast("Could not save: the core refused"); return; }
+    if (!writeFileAtomic(slotPath(n), st.data(), st.size())) { showToast("Could not write slot " + std::to_string(n + 1)); return; }
+    if (frame.valid) {  // the picture is a convenience: its failure must not hide a good save
         std::vector<uint8_t> th(4 + frame.rgb565.size() * 2);
         uint16_t wh[2] = {(uint16_t)frame.w, (uint16_t)frame.h};
         memcpy(th.data(), wh, 4); memcpy(th.data() + 4, frame.rgb565.data(), frame.rgb565.size() * 2);
-        writeFile(slotPath(n) + ".thumb", th.data(), th.size());
+        if (!writeFileAtomic(slotPath(n) + ".thumb", th.data(), th.size())) LOGE("slot %d thumbnail failed", n);
     }
     showToast("Saved to slot " + std::to_string(n + 1));
 }
@@ -954,6 +1034,7 @@ static void renderMenu() {
             case P_TABLE: v = on(cfg.table) ? "on" : "off"; break;
             case P_SIZE: snprintf(buf, sizeof buf, "%.1f m", cfg.screenWidth); v = buf; break;
             case P_DIST: snprintf(buf, sizeof buf, "%.1f m", cfg.distance); v = buf; break;
+            case P_SEAT: v = on(cfg.seatMarked) ? "depth from your seat" : "not marked yet"; break;
             }
             bool sel = k == pauseSel;
             int y = (k + 2) * CELL_H;
@@ -1295,14 +1376,17 @@ static bool initXR(android_app *app) {
 }
 
 // room passthrough (XR_FB_passthrough): created once, started only while "your room" is chosen
-static void setPassthrough(bool want) {
-    if (!hasPassthrough || want == passthroughRunning) return;
+// Returns true only when the room is actually running. A start failure leaves it off (and is
+// reported once, not once per frame) so the caller can fall back to an opaque scene.
+static bool setPassthrough(bool want) {
+    if (!hasPassthrough) { passthroughRunning = false; return false; }
     static PFN_xrCreatePassthroughFB createPt;
     static PFN_xrCreatePassthroughLayerFB createLayer;
     static PFN_xrPassthroughStartFB startPt;
     static PFN_xrPassthroughPauseFB pausePt;
     static PFN_xrPassthroughLayerResumeFB resumeLayer;
     static PFN_xrPassthroughLayerPauseFB pauseLayer;
+    static XrResult lastFail = XR_SUCCESS;
     if (!createPt) {
         xrGetInstanceProcAddr(instance, "xrCreatePassthroughFB", (PFN_xrVoidFunction *)&createPt);
         xrGetInstanceProcAddr(instance, "xrCreatePassthroughLayerFB", (PFN_xrVoidFunction *)&createLayer);
@@ -1310,25 +1394,45 @@ static void setPassthrough(bool want) {
         xrGetInstanceProcAddr(instance, "xrPassthroughPauseFB", (PFN_xrVoidFunction *)&pausePt);
         xrGetInstanceProcAddr(instance, "xrPassthroughLayerResumeFB", (PFN_xrVoidFunction *)&resumeLayer);
         xrGetInstanceProcAddr(instance, "xrPassthroughLayerPauseFB", (PFN_xrVoidFunction *)&pauseLayer);
-        if (!createPt || !createLayer || !startPt || !pausePt || !resumeLayer || !pauseLayer) { hasPassthrough = false; return; }
+        if (!createPt || !createLayer || !startPt || !pausePt || !resumeLayer || !pauseLayer) { hasPassthrough = false; passthroughRunning = false; return false; }
     }
+    if (want == passthroughRunning) return passthroughRunning;
     if (want) {
+        static double nextTry = 0;  // a room that is not available now must not be retried every frame
+        if (nowSec() < nextTry) return false;
         if (!passthrough) {
             XrPassthroughCreateInfoFB pci{XR_TYPE_PASSTHROUGH_CREATE_INFO_FB};
-            if (XR_FAILED(createPt(session, &pci, &passthrough))) { trace("passthrough unavailable"); hasPassthrough = false; return; }
+            if (XR_FAILED(createPt(session, &pci, &passthrough))) { trace("passthrough unavailable"); hasPassthrough = false; return false; }
+        }
+        if (!passthroughLayer) {
             XrPassthroughLayerCreateInfoFB lci{XR_TYPE_PASSTHROUGH_LAYER_CREATE_INFO_FB};
             lci.passthrough = passthrough;
             lci.purpose = XR_PASSTHROUGH_LAYER_PURPOSE_RECONSTRUCTION_FB;
-            if (XR_FAILED(createLayer(session, &lci, &passthroughLayer))) { trace("passthrough layer failed"); hasPassthrough = false; return; }
+            if (XR_FAILED(createLayer(session, &lci, &passthroughLayer))) { trace("passthrough layer failed"); hasPassthrough = false; return false; }
         }
-        startPt(passthrough);
-        resumeLayer(passthroughLayer);
+        XrResult sr = startPt(passthrough);
+        if (XR_SUCCEEDED(sr)) sr = resumeLayer(passthroughLayer);
+        if (XR_FAILED(sr)) {  // your room is not available in this state: stay opaque and look again soon
+            if (sr != lastFail) trace("passthrough start failed (%d)", (int)sr);
+            lastFail = sr;
+            nextTry = nowSec() + 1.0;
+            passthroughRunning = false;
+            return false;
+        }
+        lastFail = XR_SUCCESS;
+        nextTry = 0;
+        passthroughRunning = true;
+        trace("passthrough on");
     } else {
-        pauseLayer(passthroughLayer);
-        pausePt(passthrough);
+        // Pause in the order the runtime expects, and only touch handles that exist: a layer left
+        // running across a session stop is never resolvable again, which is what leaves the room
+        // permanently broken (the runtime reports a failed layer lookup every single frame).
+        if (passthroughLayer) pauseLayer(passthroughLayer);
+        if (passthrough) pausePt(passthrough);
+        passthroughRunning = false;
+        trace("passthrough off");
     }
-    passthroughRunning = want;
-    trace("passthrough %s", want ? "on" : "off");
+    return passthroughRunning;
 }
 
 static void requestRefreshRate() {
@@ -1339,13 +1443,16 @@ static void requestRefreshRate() {
     xrGetInstanceProcAddr(instance, "xrRequestDisplayRefreshRateFB", (PFN_xrVoidFunction *)&requestRate);
     if (!enumRates || !requestRate) return;
     uint32_t n = 0;
-    enumRates(session, 0, &n, nullptr);
+    if (XR_FAILED(enumRates(session, 0, &n, nullptr)) || n == 0) { trace("display refresh: none advertised"); return; }
     std::vector<float> rates(n);
-    enumRates(session, n, &n, rates.data());
+    if (XR_FAILED(enumRates(session, n, &n, rates.data()))) return;
+    std::string list;
+    for (float r : rates) { char b[16]; snprintf(b, sizeof b, "%s%.0f", list.empty() ? "" : ",", r); list += b; }
     float best = 0;
     for (float r : rates) if (fabsf(r - 120.0f) < 0.5f) best = r;  // 120 Hz shows 60 fps games without judder
     if (best == 0) for (float r : rates) if (fabsf(r - 90.0f) > 0.5f && r > best) best = r;
-    if (best > 0) { requestRate(session, best); LOGI("display refresh %.0f Hz", best); }
+    if (best > 0) { XrResult rr = requestRate(session, best); LOGI("display refresh %.0f Hz", best); trace("display refresh %.0f Hz of [%s] (request %d)", best, list.c_str(), (int)rr); }
+    else trace("display refresh: offered [%s], none requested", list.c_str());
 }
 
 static void handleXrEvents(android_app *app) {
@@ -1358,9 +1465,15 @@ static void handleXrEvents(android_app *app) {
             if (sessionState == XR_SESSION_STATE_READY) {
                 XrSessionBeginInfo bi{XR_TYPE_SESSION_BEGIN_INFO};
                 bi.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-                if (XR_SUCCEEDED(xrBeginSession(session, &bi))) { sessionRunning = true; requestRefreshRate(); }
+                XrResult br = xrBeginSession(session, &bi);
+                if (XR_SUCCEEDED(br)) { sessionRunning = true; requestRefreshRate(); }
+                else trace("xrBeginSession failed (%d)", (int)br);
             } else if (sessionState == XR_SESSION_STATE_STOPPING) {
+                setPassthrough(false);  // the room has to stop with the session, or the runtime can
+                                        // never resolve the layer again (it fails every frame after)
                 xrEndSession(session); sessionRunning = false; saveSram(); saveResume();
+            } else if (sessionState == XR_SESSION_STATE_IDLE) {
+                setPassthrough(false);
             } else if (sessionState == XR_SESSION_STATE_EXITING || sessionState == XR_SESSION_STATE_LOSS_PENDING) {
                 ANativeActivity_finish(app->activity);
             }
@@ -1567,11 +1680,17 @@ static void menuInput(const bool *b) {
         switch (item) {
         case P_RESUME: menuMode = MENU_NONE; break;
         case P_CONTROLS: menuMode = MENU_CONTROLS; controlsSel = 0; break;
-        case P_RESET: defaultPlacement(); saveGlobal(); showToast("Moved in front of you"); break;
+        case P_RESET:
+            markSeatHere();
+            defaultPlacement(); saveGlobal();
+            showToast("Moved in front of you");
+            break;
+        case P_SEAT: markSeatAndTell(); break;
         case P_HANG:  // a framed window at eye height in front of you; carry it to a wall with the bar
             cfg.table = 0; cfg.box = 2; cfg.sky = 1; cfg.popLook = 1;
             if (hasRoomView()) cfg.room = 1;
             cfg.screenWidth = 1.2f; cfg.distance = 1.6f;
+            markSeatHere();  // hanging it in front of you defines where you are sitting
             defaultPlacement(); saveGlobal(); newFrame = frame.valid;
             showToast("Point at the bar under the frame and hold the trigger to carry it to a wall");
             break;
@@ -1841,7 +1960,7 @@ static void buildWindow(const float *m) {
     // different so the corners read
     // the walls flare out exactly along the sheet edges seen from the usual spot (distance D in front),
     // so head-on they are edge-on and invisible; from the side they fill what the game never drew
-    float D = std::max(0.4f, sqrtf(cfg.px * cfg.px + cfg.py * cfg.py + cfg.pz * cfg.pz));
+    float D = placementDepth();
     float L = 24.0f * D, k = (D + L) / D;
     static const float wl[4][4] = {{0.10f, 0.09f, 0.09f, 1}, {0.07f, 0.065f, 0.065f, 1}, {0.085f, 0.08f, 0.08f, 1}, {0.12f, 0.11f, 0.105f, 1}};
     XrVector3f a = P(-W / 2, -H / 2, 0), b = P(W / 2, -H / 2, 0), c = P(W / 2, H / 2, 0), d = P(-W / 2, H / 2, 0);
@@ -1909,7 +2028,7 @@ void android_main(android_app *app) {
     worker.start();
     {   // test hook: files/autostart.txt names a ROM to load immediately (file is consumed)
         std::vector<uint8_t> a;
-        if (readFile(filesDir + "/autostart.txt", a)) {
+        if (kDevHooks && readFile(filesDir + "/autostart.txt", a)) {
             std::string n(a.begin(), a.end());
             while (!n.empty() && (n.back() == '\n' || n.back() == '\r')) n.pop_back();
             remove((filesDir + "/autostart.txt").c_str());
@@ -1940,7 +2059,7 @@ void android_main(android_app *app) {
         handleXrEvents(app);
         if (!sessionRunning) {
             // debug: files/debug_headless keeps the game running with the headset off (for adb tests)
-            static bool headless = access((filesDir + "/debug_headless").c_str(), F_OK) == 0;
+            static bool headless = kDevHooks && access((filesDir + "/debug_headless").c_str(), F_OK) == 0;
             if (headless && gameLoaded && menuMode == MENU_NONE) {
                 bool in[B_COUNT], rw, ff;
                 gameButtons(in, rw, ff);
@@ -2012,9 +2131,9 @@ void android_main(android_app *app) {
 
         XrFrameWaitInfo fwi{XR_TYPE_FRAME_WAIT_INFO};
         XrFrameState fs{XR_TYPE_FRAME_STATE};
-        if (XR_FAILED(xrWaitFrame(session, &fwi, &fs))) continue;
+        if (XR_FAILED(xrWaitFrame(session, &fwi, &fs))) { usleep(2000); continue; }
         XrFrameBeginInfo fbi{XR_TYPE_FRAME_BEGIN_INFO};
-        xrBeginFrame(session, &fbi);
+        if (XR_FAILED(xrBeginFrame(session, &fbi))) continue;  // never end a frame we could not begin
 
         pollActions();
         {   // head pose for menus and placement presets
@@ -2043,7 +2162,7 @@ void android_main(android_app *app) {
             if (xrMenu != lastMenu) { trace("input PopUp16-menu button %s", xrMenu ? "down" : "up"); lastMenu = xrMenu; }
         }
         {   // debug (with files/debug_headless): capture requests from adb, also while the headset is worn
-            static bool dbg = access((filesDir + "/debug_headless").c_str(), F_OK) == 0;
+            static bool dbg = kDevHooks && access((filesDir + "/debug_headless").c_str(), F_OK) == 0;
             static double nextCheck = 0;
             if (dbg && nowSec() > nextCheck) {
                 nextCheck = nowSec() + 0.5;
@@ -2179,7 +2298,7 @@ void android_main(android_app *app) {
         XrCompositionLayerQuad quads[1];
         const XrCompositionLayerBaseHeader *layers[3];
         uint32_t nl = 0;
-        bool roomVisible = passthroughRunning && fs.shouldRender;
+        bool roomVisible = passthroughRunning && passthroughLayer != XR_NULL_HANDLE && fs.shouldRender;
         if (roomVisible) {
             ptLayer.flags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
             ptLayer.layerHandle = passthroughLayer;
@@ -2190,7 +2309,7 @@ void android_main(android_app *app) {
             // 80% of the eye separation; the shader never lets a shift reach 90% of it (no divergence).
             float pxM = cfg.screenWidth / 256.0f;
             float autoScale = (0.80f * ipd / pxM) / 8.5f;
-            float viewDist = std::max(0.4f, sqrtf(cfg.px * cfg.px + cfg.py * cfg.py + cfg.pz * cfg.pz));
+            float viewDist = placementDepth();
             float screen[4] = {cfg.screenWidth, cfg.screenWidth * 3.0f / 4.0f, viewDist, pxM};
             float model[16];
             placementMatrix(model);
@@ -2260,7 +2379,9 @@ void android_main(android_app *app) {
         fei.displayTime = fs.predictedDisplayTime;
         fei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
         fei.layerCount = nl; fei.layers = layers;
-        xrEndFrame(session, &fei);
+        XrResult er = xrEndFrame(session, &fei);
+        static XrResult lastEnd = XR_SUCCESS;  // report a rejected frame once, not 90 times a second
+        if (er != lastEnd) { trace("xrEndFrame -> %d (%u layers)", (int)er, nl); lastEnd = er; }
     }
 
     worker.stop();

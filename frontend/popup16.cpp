@@ -210,9 +210,13 @@ static bool readFile(const std::string &p, std::vector<uint8_t> &out) {
     fclose(f);
     return ok;
 }
-static void writeFile(const std::string &p, const void *d, size_t n) {
+static bool writeFile(const std::string &p, const void *d, size_t n) {
     FILE *f = fopen(p.c_str(), "wb");
-    if (f) { fwrite(d, 1, n, f); fclose(f); }
+    if (!f) { fprintf(stderr, "cannot write %s\n", p.c_str()); return false; }
+    bool ok = fwrite(d, 1, n, f) == n;
+    if (fclose(f) != 0) ok = false;
+    if (!ok) fprintf(stderr, "incomplete write %s\n", p.c_str());
+    return ok;
 }
 static std::string lower(std::string s) { for (auto &c : s) c = (char)tolower(c); return s; }
 static std::string shq(const std::string &s) {
@@ -387,23 +391,32 @@ int main(int argc, char **argv) {
     }
 
     if (dump) {
-        int n = atoi(argv[4]);
+        char *end = nullptr;
+        long frames = strtol(argv[4], &end, 10);
+        if (!end || *end || frames < 1 || frames > 100000) {
+            fprintf(stderr, "dump frames must be an integer from 1 to 100000\n"); return 1;
+        }
+        int n = (int)frames;
         bool scripted = getenv("POPUP16_AUTO") != nullptr;
         // POPUP16_PLANES=<prefix>: also write each solo layer (BG1-4, OBJ) as <prefix>N.bmp, empty = magenta
         const char *planePrefix = getenv("POPUP16_PLANES");
         auto enablePlanes = (void (*)(int))dlsym(core.h, "snes3d_enable_planes");
-        if (planePrefix && enablePlanes) enablePlanes(1);
+        if (planePrefix && (!enablePlanes || !core.get_layers || !core.get_depths)) {
+            fprintf(stderr, "exactness test requires patched layer and plane exports\n"); return 1;
+        }
+        if (planePrefix) enablePlanes(1);
         if (getenv("POPUP16_REWINDTEST")) {
             // snapshot every 3 frames, then walk the whole history back and compare with the originals
             Rewind rw;
             std::vector<std::vector<uint8_t>> kept;
             size_t sz = core.serialize_size(), raw = 0;
+            if (!sz || n < 4) { fprintf(stderr, "rewind test requires state support and at least 4 frames\n"); return 1; }
             double t0 = SDL_GetPerformanceCounter();
             for (int i = 0; i < n; i++) {
                 autoFrame = i; core.run();
                 if (i % 3 == 0) {
                     std::vector<uint8_t> st(sz);
-                    core.serialize(st.data(), sz);
+                    if (!core.serialize(st.data(), sz)) { fprintf(stderr, "rewind snapshot failed at frame %d\n", i); return 1; }
                     rw.push(st); kept.push_back(st); raw += sz;
                 }
             }
@@ -412,10 +425,12 @@ int main(int argc, char **argv) {
             int bad = 0, steps = 0;
             std::vector<uint8_t> back;
             for (int k = (int)kept.size() - 2; k >= 0 && rw.pop(back); k--, steps++) bad += back != kept[k];
-            bool restored = core.unserialize(back.data(), back.size());
+            bool restored = !back.empty() && core.unserialize(back.data(), back.size());
             printf("rewind: %zu snapshots of %zu B, history %zu B (%.1f%% of raw), %d steps back, %d mismatches, restore %s, %.1f ms for %d frames\n",
                    depth + 1, sz, bytes, 100.0 * bytes / std::max<size_t>(raw, 1), steps, bad, restored ? "ok" : "FAILED", ms, n);
-            return 0;
+            bool complete = steps == (int)kept.size() - 1;
+            if (!complete) fprintf(stderr, "rewind history incomplete: %d of %zu steps\n", steps, kept.size() - 1);
+            return bad == 0 && restored && complete ? 0 : 1;
         }
         for (int i = 0; i < n; i++) { if (scripted) autoFrame = i; core.run(); }
         if (!cur.valid) { fprintf(stderr, "no frame\n"); return 1; }
@@ -431,11 +446,16 @@ int main(int argc, char **argv) {
                 uint8_t *px = &bmp[54 + (size_t)(H - 1 - y) * rowB + x * 3];
                 px[0] = c & 255; px[1] = (c >> 8) & 255; px[2] = (c >> 16) & 255;
             }
-        writeFile(argv[5], bmp.data(), bmp.size());
-        if (planePrefix && enablePlanes) {
+        if (!writeFile(argv[5], bmp.data(), bmp.size())) return 1;
+        int verificationStatus = 0;
+        if (planePrefix) {
             auto pc = (const uint16_t *(*)(int))dlsym(core.h, "snes3d_get_plane_color");
             auto pz = (const uint8_t *(*)(int))dlsym(core.h, "snes3d_get_plane_z");
+            if (!pc || !pz) { fprintf(stderr, "exactness test requires solo plane exports\n"); return 1; }
             unsigned w = cur.w, h = cur.h, ppl = 512;  // GFX.Pitch / 2 (MAX_SNES_WIDTH)
+            if (!w || !h || w > diorama::TEX_W || h > diorama::TEX_H) {
+                fprintf(stderr, "unsupported exactness frame size %ux%u\n", w, h); return 1;
+            }
             int rb = (w * 3 + 3) & ~3;
             for (int n = 0; n < 5; n++) {
                 std::vector<uint8_t> pb(54 + (size_t)rb * h, 0);
@@ -443,6 +463,7 @@ int main(int argc, char **argv) {
                 pb[0] = 'B'; pb[1] = 'M'; p32(2, (uint32_t)pb.size()); p32(10, 54); p32(14, 40);
                 p32(18, w); p32(22, h); pb[26] = 1; pb[28] = 24; p32(34, (uint32_t)(rb * h));
                 const uint16_t *c = pc(n); const uint8_t *z = pz(n);
+                if (!c || !z) { fprintf(stderr, "missing solo plane %d\n", n); return 1; }
                 int count = 0;
                 for (unsigned y = 0; y < h; y++)
                     for (unsigned x = 0; x < w; x++) {
@@ -451,7 +472,7 @@ int main(int argc, char **argv) {
                         count += z[y * ppl + x] != 0;
                         px[0] = v & 255; px[1] = (v >> 8) & 255; px[2] = (v >> 16) & 255;
                     }
-                writeFile(std::string(planePrefix) + std::to_string(n) + ".bmp", pb.data(), pb.size());
+                if (!writeFile(std::string(planePrefix) + std::to_string(n) + ".bmp", pb.data(), pb.size())) return 1;
                 printf("plane %d: %d px\n", n, count);
             }
             // diorama check: stacking the sheets far to near, seen head-on, must give back the frame
@@ -480,6 +501,7 @@ int main(int argc, char **argv) {
             for (size_t i = 0; i < out.size(); i++) bad += out[i] != (db.lut[cur.rgb565[i]] & 0xffffff);
             int sheets = 0; { std::vector<int> seen; for (auto &q : db.quads) { int k = (int)q.slice * 256 + (int)q.z; if (std::find(seen.begin(), seen.end(), k) == seen.end()) seen.push_back(k); } sheets = (int)seen.size(); }
             printf("diorama: %zu quads, %d sheets, head-on mismatch %d of %zu px\n", db.quads.size(), sheets, bad, out.size());
+            verificationStatus = bad == 0 ? 0 : 1;
             if (db.frameHasM7) {
                 // HD floor check: the map colour at each floor pixel's centre must match what the SNES drew
                 int first = din.m7flags >> 9, n7 = 0, ok7 = 0;
@@ -519,7 +541,7 @@ int main(int argc, char **argv) {
                         uint8_t *px = &pb[54 + (size_t)(H4 - 1 - Y) * rb4 + X * 3];
                         px[0] = (c >> 16) & 255; px[1] = (c >> 8) & 255; px[2] = c & 255;
                     }
-                writeFile(std::string(planePrefix) + "hd.bmp", pb.data(), pb.size());
+                if (!writeFile(std::string(planePrefix) + "hd.bmp", pb.data(), pb.size())) return 1;
             }
             {   // the same view with the pop-up look baked in, written next to the planes
                 db.look.on = true;
@@ -540,7 +562,7 @@ int main(int argc, char **argv) {
                         uint8_t *px = &pb[54 + (size_t)(h - 1 - y) * rb + x * 3];
                         px[0] = (v >> 16) & 255; px[1] = (v >> 8) & 255; px[2] = v & 255;  // RGBA bytes -> BGR
                     }
-                writeFile(std::string(planePrefix) + "look.bmp", pb.data(), pb.size());
+                if (!writeFile(std::string(planePrefix) + "look.bmp", pb.data(), pb.size())) return 1;
             }
             if (getenv("POPUP16_SHEETS"))
                 for (auto &q : db.quads) if (q.v == (float)(h / 2)) printf("  row %d slice %d z %d disparity %+.2f span %d-%d\n", (int)q.v, (int)q.slice, (int)q.z, q.disparity, (int)q.u0, (int)q.u1);
@@ -559,7 +581,7 @@ int main(int argc, char **argv) {
         for (uint8_t l : cur.layers) hist[l & 7]++;
         printf("frame %ux%u layers: BG1 %d BG2 %d BG3 %d BG4 %d OBJ %d backdrop %d M7 %d M7ext %d\n",
                cur.w, cur.h, hist[0], hist[1], hist[2], hist[3], hist[4], hist[5], hist[6], hist[7]);
-        return 0;
+        return verificationStatus;
     }
 
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
