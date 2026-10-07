@@ -74,8 +74,16 @@ parts.append(section("Spleen font", read(os.path.join(ROOT, "tools/fonts/SPLEEN-
 sdl = "/opt/homebrew/opt/sdl2/LICENSE.txt"
 if os.path.exists(sdl):
     parts.append(section("SDL 2 (Mac frontend only)", read(sdl)))
-apache = subprocess.run(["unzip", "-p", AAR, "META-INF/LICENSE"], capture_output=True, text=True).stdout
-parts.append(section("Khronos OpenXR loader for Android - Apache License 2.0 and bundled notices", apache.rstrip() + "\n"))
+apache = subprocess.run(["unzip", "-p", AAR, "META-INF/LICENSE"], capture_output=True, text=True)
+if apache.returncode != 0 or not apache.stdout.strip():
+    # Fail closed: nothing is written below this line, so a broken extraction can never produce a
+    # notices file that quietly ships without the OpenXR license text.
+    raise SystemExit(
+        "make_notices: could not read META-INF/LICENSE from "
+        f"{os.path.relpath(AAR, ROOT)} (unzip exit {apache.returncode}).\n"
+        "Refusing to write incomplete notices. Re-run ./setup.sh to restore the OpenXR loader archive."
+    )
+parts.append(section("Khronos OpenXR loader for Android - Apache License 2.0 and bundled notices", apache.stdout.rstrip() + "\n"))
 
 text = "\n".join(parts)
 with open(os.path.join(ROOT, "THIRD_PARTY_NOTICES.txt"), "w") as f:

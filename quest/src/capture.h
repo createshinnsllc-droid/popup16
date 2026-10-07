@@ -68,11 +68,13 @@ public:
         f.key = key;
         sinceKey = key ? 1 : sinceKey + 1;
         prev.assign((const uint8_t *)px, (const uint8_t *)px + n);
+        bytes += f.packed.size();
         frames.push_back(std::move(f));
-        // keep 30 s, and always start on a full frame
-        while (frames.size() > (size_t)(SECONDS * fps)) {
+        // keep 30 s and at most BUDGET bytes (noisy scenes pack badly), always starting on a full frame
+        while (frames.size() > (size_t)(SECONDS * fps) || (bytes > BUDGET && frames.size() > 1)) {
+            bytes -= frames.front().packed.size();
             frames.pop_front();
-            while (!frames.empty() && !frames.front().key) frames.pop_front();
+            while (!frames.empty() && !frames.front().key) { bytes -= frames.front().packed.size(); frames.pop_front(); }
         }
     }
     void pushAudio(int16_t l, int16_t r) {  // 48 kHz stereo, as played
@@ -81,7 +83,7 @@ public:
         aw = (aw + 1) % (audio.size() / 2);
         if (aFill < audio.size() / 2) aFill++;
     }
-    void clear() { std::lock_guard<std::mutex> l(m); frames.clear(); prev.clear(); aFill = 0; aw = 0; }
+    void clear() { std::lock_guard<std::mutex> l(m); frames.clear(); prev.clear(); bytes = 0; aFill = 0; aw = 0; }
     double seconds() { std::lock_guard<std::mutex> l(m); return frames.size() / fps; }
 
     bool busy() const { return working.load(); }
@@ -97,9 +99,11 @@ public:
         if (working.exchange(true)) return false;
         std::deque<Frame> f;
         std::vector<int16_t> a;
+        double rate;
         {
             std::lock_guard<std::mutex> l(m);
             f = frames;
+            rate = fps;  // the encode uses this rate even if another game loads meanwhile
             size_t n = aFill, cap = audio.size() / 2;
             a.resize(n * 2);
             for (size_t i = 0; i < n; i++) {  // oldest first
@@ -108,9 +112,14 @@ public:
             }
         }
         if (worker.joinable()) worker.join();
-        worker = std::thread([this, f = std::move(f), a = std::move(a), path]() mutable {
+        worker = std::thread([this, f = std::move(f), a = std::move(a), path, rate]() mutable {
             std::string msg;
-            bool ok = encode(f, a, path, msg);
+            // written beside the destination and published only once complete
+            // (the shared Movies folder only accepts video file names, so the temporary name ends in .mp4 too)
+            std::string part = path.size() > 4 ? path.substr(0, path.size() - 4) + ".writing.mp4" : path + ".writing.mp4";
+            bool ok = encode(f, a, part, rate, msg);
+            if (ok && rename(part.c_str(), path.c_str()) != 0) { ok = false; msg = "Could not finish the clip file"; }
+            if (!ok) remove(part.c_str());
             { std::lock_guard<std::mutex> l(m); resultMsg = msg; }
             result = ok ? 1 : -1;
             working = false;
@@ -120,8 +129,10 @@ public:
     ~Recorder() { if (worker.joinable()) worker.join(); }
 
 private:
+    static constexpr size_t BUDGET = 192u << 20;  // packed frame history cap
     std::mutex m;
     std::deque<Frame> frames;
+    size_t bytes = 0;
     std::vector<uint8_t> prev;
     int sinceKey = 0;
     std::vector<int16_t> audio;
@@ -165,13 +176,14 @@ private:
         return -1;
     }
 
-    bool encode(std::deque<Frame> &frames, std::vector<int16_t> &audioPcm, const std::string &path, std::string &msg) {
+    bool encode(std::deque<Frame> &frames, std::vector<int16_t> &audioPcm, const std::string &path, double fps, std::string &msg) {
 #define CLOG(...) __android_log_print(ANDROID_LOG_INFO, "PopUp16clip", __VA_ARGS__)
         CLOG("encode: %zu frames, %zu audio samples -> %s", frames.size(), audioPcm.size() / 2, path.c_str());
         if (frames.empty()) { msg = "Nothing to save yet"; return false; }
-        const int S = 2;  // 2x pixels: 512x448 for a 256x224 game
-        const int W = frames.front().w * S, H = frames.front().h * S;
-        const int EW = (W + 15) & ~15, EH = (H + 15) & ~15;
+        // One fixed 512x448 canvas for the whole clip: every frame is scaled onto it, so normal (256 wide),
+        // hires (512 wide) and interlaced (448 tall) frames can mix in one recording without the encoder
+        // or its buffer ever changing size.
+        const int EW = 512, EH = 448;
         std::vector<Sample> vs, as;
         AMediaFormat *vfmt = nullptr, *afmt = nullptr;
 
@@ -197,26 +209,31 @@ private:
             if (fr.key || cur.size() != n) cur.assign(n, 0);
             applyDiff(fr.packed, cur.data());
             const uint16_t *px = (const uint16_t *)cur.data();
-            // RGB565 to BT.601 limited-range NV12, each source pixel becoming an SxS block
-            std::fill(nv12.begin(), nv12.begin() + (size_t)EW * EH, 16);
-            std::fill(nv12.begin() + (size_t)EW * EH, nv12.end(), 128);
-            for (int y = 0; y < fr.h; y++)
-                for (int x = 0; x < fr.w; x++) {
-                    uint16_t c = px[y * fr.w + x];
-                    int r = ((c >> 11) & 31) * 255 / 31, g = ((c >> 5) & 63) * 255 / 63, b = (c & 31) * 255 / 31;
-                    uint8_t Y = (uint8_t)(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
-                    for (int dy = 0; dy < S; dy++) memset(&nv12[(size_t)(y * S + dy) * EW + x * S], Y, S);
-                    if (S == 2) {  // one chroma sample per 2x2 block = per source pixel
-                        uint8_t *uv = &nv12[(size_t)EW * EH + (size_t)y * EW + x * 2];
-                        uv[0] = (uint8_t)(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);  // Cb
-                        uv[1] = (uint8_t)(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);   // Cr
-                    }
+            // RGB565 to BT.601 limited-range NV12 on the canvas (nearest source pixel)
+            auto rgbAt = [&](int X, int Y, int &r, int &g, int &b) {
+                uint16_t c = px[(size_t)(Y * fr.h / EH) * fr.w + (size_t)(X * fr.w / EW)];
+                r = ((c >> 11) & 31) * 255 / 31; g = ((c >> 5) & 63) * 255 / 63; b = (c & 31) * 255 / 31;
+            };
+            for (int Y = 0; Y < EH; Y++)
+                for (int X = 0; X < EW; X++) {
+                    int r, g, b;
+                    rgbAt(X, Y, r, g, b);
+                    nv12[(size_t)Y * EW + X] = (uint8_t)(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
+                }
+            for (int Y = 0; Y < EH; Y += 2)
+                for (int X = 0; X < EW; X += 2) {
+                    int r, g, b;
+                    rgbAt(X, Y, r, g, b);
+                    uint8_t *uv = &nv12[(size_t)EW * EH + (size_t)(Y / 2) * EW + X];
+                    uv[0] = (uint8_t)(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);  // Cb
+                    uv[1] = (uint8_t)(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);   // Cr
                 }
             ssize_t in = nextInput(ve, vs, &vfmt);
             if (in < 0) { CLOG("video encoder stalled at frame %zu", idx); break; }
             size_t cap;
             uint8_t *ib = AMediaCodec_getInputBuffer(ve, in, &cap);
-            size_t len = std::min(cap, nv12.size());
+            if (!ib || cap < nv12.size()) { CLOG("encoder input buffer too small (%zu < %zu)", cap, nv12.size()); break; }
+            size_t len = nv12.size();
             memcpy(ib, nv12.data(), len);
             int64_t pts = (int64_t)(idx * 1e6 / fps);
             AMediaCodec_queueInputBuffer(ve, in, 0, len, pts, ++idx == total ? AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM : 0);
@@ -270,19 +287,20 @@ private:
         AMediaMuxer *mx = AMediaMuxer_new(fd, AMEDIAMUXER_OUTPUT_FORMAT_MPEG_4);
         ssize_t vt = AMediaMuxer_addTrack(mx, vfmt);
         ssize_t at = (afmt && !as.empty()) ? AMediaMuxer_addTrack(mx, afmt) : -1;
-        AMediaMuxer_start(mx);
         size_t vi = 0, ai = 0;
-        while (vi < vs.size() || (at >= 0 && ai < as.size())) {
+        bool muxOk = vt >= 0 && AMediaMuxer_start(mx) == AMEDIA_OK;
+        while (muxOk && (vi < vs.size() || (at >= 0 && ai < as.size()))) {
             bool takeV = at < 0 || ai >= as.size() || (vi < vs.size() && vs[vi].pts <= as[ai].pts);
             Sample &sm = takeV ? vs[vi++] : as[ai++];
             AMediaCodecBufferInfo info{0, (int32_t)sm.data.size(), sm.pts, sm.flags & ~AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM};
-            AMediaMuxer_writeSampleData(mx, takeV ? vt : at, sm.data.data(), &info);
+            if (AMediaMuxer_writeSampleData(mx, takeV ? vt : at, sm.data.data(), &info) != AMEDIA_OK) { muxOk = false; break; }
         }
-        AMediaMuxer_stop(mx);
+        if (AMediaMuxer_stop(mx) != AMEDIA_OK) muxOk = false;
         AMediaMuxer_delete(mx);
         close(fd);
         AMediaFormat_delete(vfmt);
         if (afmt) AMediaFormat_delete(afmt);
+        if (!muxOk || vs.empty()) { msg = "Could not write the clip file"; return false; }
         char b[96];
         snprintf(b, sizeof b, "Clip saved (%.0f s)", clipSec);
         msg = b;

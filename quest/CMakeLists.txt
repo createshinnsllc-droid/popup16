@@ -28,8 +28,16 @@ set(OXR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/oxr/prefab/modules)
 add_library(openxr_loader SHARED IMPORTED)
 set_target_properties(openxr_loader PROPERTIES IMPORTED_LOCATION ${OXR}/openxr_loader/libs/android.arm64-v8a/libopenxr_loader.so)
 
+# Developer test hooks are off by default; -DPOPUP16_DEV_HOOKS=ON only for a build you drive with
+# files under the app's own data folder. A normal APK ships without that reachability.
+option(POPUP16_DEV_HOOKS "Compile in the developer test hooks (autostart.txt, debug_headless, request files)" OFF)
+
 add_library(popup16quest SHARED src/main.cpp)
 target_include_directories(popup16quest PRIVATE ${OXR}/headers/include ${S9X}/libretro)
 target_compile_options(popup16quest PRIVATE -O2 -Wall -Wno-missing-field-initializers)
 target_link_options(popup16quest PRIVATE -u ANativeActivity_onCreate)
 target_link_libraries(popup16quest snes9x native_app_glue openxr_loader android log EGL GLESv3 aaudio jnigraphics mediandk z)
+if(POPUP16_DEV_HOOKS)
+  target_compile_definitions(popup16quest PRIVATE POPUP16_DEV_HOOKS=1)
+  message(STATUS "PopUp16: developer test hooks ENABLED in this build")
+endif()

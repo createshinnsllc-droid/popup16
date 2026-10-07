@@ -43,8 +43,29 @@ quest/build_apk.sh    # Quest APK -> quest/build/popup16.apk (needs Android SDK 
 Enable developer mode, connect over USB, then:
 
 ```sh
-quest/install_quest.sh "/path/to/your/game/folder"
+quest/install_quest.sh "/path/to/your/game/folder"   # first time: app + games + covers
+quest/update_app.sh                                   # later: replace the app only
 ```
+
+The installer only copies files the headset is missing. It never deletes or replaces games, covers or
+saves, so it is safe to run again. `--migrate-old-saves` also brings saves over from the old SNES3D app.
+
+## Tests
+
+```sh
+python3 test/run_regressions.py --binary frontend/popup16 --core snes9x/libretro/snes9x_libretro.dylib \
+  --rom-dir "/path/to/your/game/folder"
+```
+
+Eight games plus a generated test ROM must rebuild every frame exactly from the depth sheets
+(0 mismatched pixels) and rewind exactly. `DEV=1 quest/build_apk.sh` builds a test APK with the
+developer hooks described in `docs/modernization-review.md`; normal builds contain none.
+
+## Releasing
+
+`quest/make_release_key.sh` creates your own signing key (you choose its password), then
+`RELEASE_KEYSTORE=~/.android/popup16-release.jks quest/build_apk.sh` signs with it. Keep that key and
+password safe: every later update must be signed with the same key.
 
 Games go to `Android/data/com.createshinns.popup16/files/roms` on the headset (`.sfc`/`.smc`);
 covers in `<rom folder>/covers` are copied to `files/covers`.
@@ -68,6 +89,10 @@ Every button can be reassigned, for one game or for all games, under menu > Cont
 remapping, including Rewind and Fast-forward. Menus always use A to select and B to go back.
 
 ## How it works
+
+The Quest app is one translation unit: `quest/src/main.cpp` holds the frame loop and includes the
+`app_*.h` modules (settings, audio, input, core, capture, controls, library, menu, menu input, XR,
+placement, pointer) in order.
 
 `snes9x-stereo3d.patch` makes the Snes9x renderer record which layer drew each pixel
 and also draw each main-screen layer on its own. `shared/diorama.h` turns those layers
