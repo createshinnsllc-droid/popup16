@@ -1,7 +1,8 @@
 From e81b910ff5ef587b72a262d2c35be16781f8b9f0 Mon Sep 17 00:00:00 2001
 From: CreateShinns <261191256+createshinnsllc-droid@users.noreply.github.com>
 Date: Wed, 7 Oct 2026 07:18:55 -0400
-Subject: [PATCH] Export per-pixel layer id and priority depth for stereo 3D
+Subject: [PATCH 1/2] Export per-pixel layer id and priority depth for stereo
+ 3D
 
 Adds GFX.LayerBuf (layer id per main-screen pixel: 0-3 BG1-4, 4 OBJ,
 5 backdrop, 6/7 Mode 7) written alongside the existing Z-buffer, and
@@ -201,6 +202,198 @@ index 4025c69..e5077f6 100644
  		}
  	}
  
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 3e98162cc25cd43feeafef2594bdc08f233394ce Mon Sep 17 00:00:00 2001
+From: CreateShinns <261191256+createshinnsllc-droid@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 07:41:30 -0400
+Subject: [PATCH 2/2] Render each main-screen layer on its own for the diorama
+ view
+
+GFX.RenderPlanes adds one extra pass per layer (BG1-4, OBJ) into
+LayerColor/LayerZ without colour math or backdrop; exported through
+snes3d_enable_planes / snes3d_get_plane_color / snes3d_get_plane_z.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gfx.cpp               | 48 +++++++++++++++++++++++++++++++++++--------
+ gfx.h                 |  3 +++
+ libretro/libretro.cpp |  7 ++++++-
+ 3 files changed, 49 insertions(+), 9 deletions(-)
+
+diff --git a/gfx.cpp b/gfx.cpp
+index feccb6b..10408ba 100644
+--- a/gfx.cpp
++++ b/gfx.cpp
+@@ -35,7 +35,7 @@ static void DrawBackgroundOffset (int, uint8, uint8, int);
+ static void DrawBackgroundOffsetMosaic (int, uint8, uint8, int);
+ static inline void DrawBackgroundMode7 (int, void (*DrawMath) (uint32, uint32, int), void (*DrawNomath) (uint32, uint32, int), int);
+ static inline void DrawBackdrop (void);
+-static inline void RenderScreen (bool8);
++static inline void RenderScreen (bool8, int solo = -1);
+ static uint16 get_crosshair_color (uint8);
+ static void S9xDisplayStringType (const char *, int, int, bool, int);
+ 
+@@ -62,6 +62,11 @@ bool8 S9xGraphicsInit (void)
+ 	GFX.LayerBuf   = (uint8 *)  calloc(GFX.ScreenSize, 1);
+ 	GFX.LayerScratch = (uint8 *) calloc(GFX.ScreenSize, 1);
+ 	GFX.LB = GFX.LayerScratch;
++	for (int n = 0; n < 5; n++)
++	{
++		GFX.LayerColor[n] = (uint16 *) calloc(GFX.ScreenSize, sizeof(uint16));
++		GFX.LayerZ[n]     = (uint8 *)  calloc(GFX.ScreenSize, 1);
++	}
+ 
+ 	if (!GFX.ZERO || !GFX.SubScreen || !GFX.ZBuffer || !GFX.SubZBuffer)
+ 	{
+@@ -112,6 +117,11 @@ void S9xGraphicsDeinit (void)
+ 	if (GFX.SubZBuffer) { free(GFX.SubZBuffer); GFX.SubZBuffer = NULL; }
+ 	if (GFX.LayerBuf)   { free(GFX.LayerBuf);   GFX.LayerBuf   = NULL; }
+ 	if (GFX.LayerScratch) { free(GFX.LayerScratch); GFX.LayerScratch = NULL; }
++	for (int n = 0; n < 5; n++)
++	{
++		if (GFX.LayerColor[n]) { free(GFX.LayerColor[n]); GFX.LayerColor[n] = NULL; }
++		if (GFX.LayerZ[n])     { free(GFX.LayerZ[n]);     GFX.LayerZ[n]     = NULL; }
++	}
+ }
+ 
+ void S9xGraphicsScreenResize (void)
+@@ -184,6 +194,9 @@ void S9xStartScreenRefresh (void)
+ 		memset(GFX.ZBuffer, 0, GFX.ScreenSize);
+ 		memset(GFX.SubZBuffer, 0, GFX.ScreenSize);
+ 		memset(GFX.LayerBuf, 5, GFX.ScreenSize);
++		if (GFX.RenderPlanes)
++			for (int n = 0; n < 5; n++)
++				memset(GFX.LayerZ[n], 0, GFX.ScreenSize);
+ 	}
+ 
+ 	if (++IPPU.FrameCount == (uint32)Memory.ROMFramesPerSecond)
+@@ -316,12 +329,24 @@ void RenderLine (uint8 C)
+ 	}
+ }
+ 
+-static inline void RenderScreen (bool8 sub)
++static inline void RenderScreen (bool8 sub, int solo)
+ {
+ 	uint8	BGActive;
+ 	int		D;
+ 
+-	if (!sub)
++	if (solo >= 0)
++	{
++		// stereo3d: one main-screen layer on its own, without colour math or backdrop
++		GFX.S = GFX.LayerColor[solo];
++		if (GFX.DoInterlace && S9xInterlaceField())
++			GFX.S += GFX.RealPPL;
++		GFX.DB = GFX.LayerZ[solo];
++		GFX.LB = GFX.LayerScratch;
++		GFX.Clip = IPPU.Clip[0];
++		BGActive = Memory.FillRAM[0x212c] & ~Settings.BG_Forced & (1 << solo);
++		D = 32;
++	}
++	else if (!sub)
+ 	{
+ 		GFX.S = GFX.Screen;
+ 		if (GFX.DoInterlace && S9xInterlaceField())
+@@ -346,7 +371,7 @@ static inline void RenderScreen (bool8 sub)
+ 	{
+ 		BG.TileAddress = PPU.OBJNameBase;
+ 		BG.NameSelect = PPU.OBJNameSelect;
+-		BG.EnableMath = !sub && (Memory.FillRAM[0x2131] & 0x10);
++		BG.EnableMath = !sub && solo < 0 && (Memory.FillRAM[0x2131] & 0x10);
+ 		BG.StartPalette = 128;
+ 		S9xSelectTileConverter(4, FALSE, sub, FALSE);
+ 		S9xSelectTileRenderers(PPU.BGMode, sub, TRUE);
+@@ -362,7 +387,7 @@ static inline void RenderScreen (bool8 sub)
+ 		{ \
+ 			GFX.CurLayer = n; \
+ 			BG.StartPalette = pal; \
+-			BG.EnableMath = !sub && (Memory.FillRAM[0x2131] & (1 << n)); \
++			BG.EnableMath = !sub && solo < 0 && (Memory.FillRAM[0x2131] & (1 << n)); \
+ 			BG.TileSizeH = (!hires && PPU.BG[n].BGSize) ? 16 : 8; \
+ 			BG.TileSizeV = (PPU.BG[n].BGSize) ? 16 : 8; \
+ 			S9xSelectTileConverter(depth, hires, sub, PPU.BGMosaic[n]); \
+@@ -428,14 +453,14 @@ static inline void RenderScreen (bool8 sub)
+ 		case 7:
+ 			if (BGActive & 0x01)
+ 			{
+-				BG.EnableMath = !sub && (Memory.FillRAM[0x2131] & 1);
++				BG.EnableMath = !sub && solo < 0 && (Memory.FillRAM[0x2131] & 1);
+ 				GFX.CurLayer = 6;
+ 				DrawBackgroundMode7(0, GFX.DrawMode7BG1Math, GFX.DrawMode7BG1Nomath, D);
+ 			}
+ 
+ 			if ((Memory.FillRAM[0x2133] & 0x40) && (BGActive & 0x02))
+ 			{
+-				BG.EnableMath = !sub && (Memory.FillRAM[0x2131] & 2);
++				BG.EnableMath = !sub && solo < 0 && (Memory.FillRAM[0x2131] & 2);
+ 				GFX.CurLayer = 7;
+ 				DrawBackgroundMode7(1, GFX.DrawMode7BG2Math, GFX.DrawMode7BG2Nomath, D);
+ 			}
+@@ -445,7 +470,10 @@ static inline void RenderScreen (bool8 sub)
+ 
+ 	#undef DO_BG
+ 
+-	BG.EnableMath = !sub && (Memory.FillRAM[0x2131] & 0x20);
++	BG.EnableMath = !sub && solo < 0 && (Memory.FillRAM[0x2131] & 0x20);
++
++	if (solo >= 0)
++		return;
+ 
+ 	GFX.CurLayer = 5;
+ 	DrawBackdrop();
+@@ -511,6 +539,10 @@ void S9xUpdateScreen (void)
+ 			RenderScreen(TRUE);
+ 
+ 		RenderScreen(FALSE);
++
++		if (GFX.RenderPlanes)
++			for (int n = 0; n < 5; n++)
++				RenderScreen(FALSE, n);
+ 	}
+ 	else
+ 	{
+diff --git a/gfx.h b/gfx.h
+index 0b2ba79..9ee1cd7 100644
+--- a/gfx.h
++++ b/gfx.h
+@@ -24,6 +24,9 @@ struct SGFX
+ 	uint8	*LayerScratch;	// stereo3d: sink for sub-screen writes
+ 	uint8	*LB;
+ 	uint8	CurLayer;
++	bool8	RenderPlanes;		// stereo3d: also render each main-screen layer on its own
++	uint16	*LayerColor[5];	// stereo3d: BG1-4, OBJ drawn alone (no colour math)
++	uint8	*LayerZ[5];		// stereo3d: priority depth per pixel of each solo layer, 0 = empty
+ 	uint16	*S;
+ 	uint8	*DB;
+ 	uint16	*ZERO;
+diff --git a/libretro/libretro.cpp b/libretro/libretro.cpp
+index 9be3fb2..e0f79e5 100644
+--- a/libretro/libretro.cpp
++++ b/libretro/libretro.cpp
+@@ -1971,7 +1971,8 @@ bool retro_unserialize(const void* data, size_t size)
+ 
+ static const uint8_t *snes3d_layers = NULL;
+ static const uint8_t *snes3d_depths = NULL;
+-#define SNES3D_SET_PTRS(off) do { snes3d_layers = GFX.LayerBuf + ((int)(GFX.Pitch >> 1) * (off)); snes3d_depths = GFX.ZBuffer + ((int)(GFX.Pitch >> 1) * (off)); } while (0)
++static int snes3d_offset = 0;
++#define SNES3D_SET_PTRS(off) do { snes3d_offset = (int)(GFX.Pitch >> 1) * (off); snes3d_layers = GFX.LayerBuf + ((int)(GFX.Pitch >> 1) * (off)); snes3d_depths = GFX.ZBuffer + ((int)(GFX.Pitch >> 1) * (off)); } while (0)
+ 
+ bool8 S9xDeinitUpdate(int width, int height)
+ {
+@@ -2082,6 +2083,10 @@ bool8 S9xDeinitUpdate(int width, int height)
+ /* stereo3d: per-pixel layer id / priority depth of the last frame, same layout as the video frame (pitch/2 bytes per row) */
+ extern "C" RETRO_API const uint8_t *snes3d_get_layers(void) { return snes3d_layers; }
+ extern "C" RETRO_API const uint8_t *snes3d_get_depths(void) { return snes3d_depths; }
++/* stereo3d: layer n (0-3 BG1-4, 4 OBJ) drawn alone; z == 0 marks empty pixels. Same layout as the frame. */
++extern "C" RETRO_API void snes3d_enable_planes(int on) { GFX.RenderPlanes = on ? TRUE : FALSE; }
++extern "C" RETRO_API const uint16_t *snes3d_get_plane_color(int n) { return n >= 0 && n < 5 ? GFX.LayerColor[n] + snes3d_offset : NULL; }
++extern "C" RETRO_API const uint8_t *snes3d_get_plane_z(int n) { return n >= 0 && n < 5 ? GFX.LayerZ[n] + snes3d_offset : NULL; }
+ 
+ bool8 S9xContinueUpdate(int width, int height)
+ {
 -- 
 2.54.0 (Apple Git-157)
 

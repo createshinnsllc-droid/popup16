@@ -3,6 +3,8 @@
 set -e
 cd "$(dirname "$0")"
 brew list sdl2 >/dev/null 2>&1 || brew install sdl2
+# the core Makefile does not track header changes, so always rebuild it clean
+make -C snes9x/libretro platform=osx clean >/dev/null
 make -C snes9x/libretro -j8 platform=osx
 clang++ -std=c++20 -O2 -Wall -Wno-unused-parameter -I/opt/homebrew/include/SDL2 -Isnes9x/libretro \
   frontend/snes3d.cpp -L/opt/homebrew/lib -lSDL2 -o frontend/snes3d

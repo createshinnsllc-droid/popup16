@@ -16,6 +16,7 @@
 #include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 #define XR_USE_PLATFORM_ANDROID
 #define XR_USE_GRAPHICS_API_OPENGL_ES
@@ -34,6 +35,7 @@
 #include "libretro.h"
 #include "../../shared/stereo.h"
 #include "font8x16.h"
+#include "renderer.h"
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "SNES3D", __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "SNES3D", __VA_ARGS__)
@@ -41,6 +43,21 @@
 
 extern "C" const uint8_t *snes3d_get_layers(void);
 extern "C" const uint8_t *snes3d_get_depths(void);
+extern "C" void snes3d_enable_planes(int on);
+extern "C" const uint16_t *snes3d_get_plane_color(int n);
+extern "C" const uint8_t *snes3d_get_plane_z(int n);
+
+// input/diagnostic trace kept on the headset (files/input.log) so a normal play session can be read back later
+static FILE *traceFile = nullptr;
+static void trace(const char *fmt, ...) {
+    char buf[256];
+    va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
+    __android_log_print(ANDROID_LOG_INFO, "SNES3D", "%s", buf);
+    if (traceFile) {
+        time_t t = time(nullptr); char ts[32]; strftime(ts, sizeof ts, "%H:%M:%S", localtime(&t));
+        fprintf(traceFile, "%s %s\n", ts, buf); fflush(traceFile);
+    }
+}
 
 static double nowSec() {
     timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
@@ -178,6 +195,7 @@ static int32_t onInput(android_app *, AInputEvent *e) {
         bool down = AKeyEvent_getAction(e) == AKEY_EVENT_ACTION_DOWN;
         if (key == AKEYCODE_BUTTON_MODE || key == AKEYCODE_BUTTON_THUMBL) { padMenu = down; return 1; }
         int b = keyToButton(key);
+        trace("gamepad key %d %s", key, down ? "down" : "up");
         if (b >= 0) { padButtons[b] = down; return 1; }
     } else if (type == AINPUT_EVENT_TYPE_MOTION && (AInputEvent_getSource(e) & AINPUT_SOURCE_JOYSTICK)) {
         float hx = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_HAT_X, 0);
@@ -195,6 +213,10 @@ static int32_t onInput(android_app *, AInputEvent *e) {
 
 // ---------------------------------------------------------------- core
 static stereo::Frame frame;
+static std::vector<uint16_t> planeColor[5];
+static std::vector<uint8_t> planeZ[5];
+static diorama::Builder sheets;
+static render::Renderer renderer;
 static bool newFrame = false;
 static bool gameLoaded = false;
 static std::string gameName, gamePath;
@@ -216,6 +238,16 @@ static bool environment(unsigned cmd, void *data) {
 static void video_cb(const void *data, unsigned w, unsigned h, size_t pitch) {
     if (!data) return;
     frame.capture(data, w, h, pitch, snes3d_get_layers(), snes3d_get_depths());
+    size_t ppl = pitch / 2;
+    for (int n = 0; n < 5; n++) {
+        const uint16_t *c = snes3d_get_plane_color(n);
+        const uint8_t *z = snes3d_get_plane_z(n);
+        planeColor[n].resize(w * h); planeZ[n].resize(w * h);
+        for (unsigned y = 0; y < h; y++) {
+            memcpy(&planeColor[n][y * w], c + y * ppl, w * 2);
+            memcpy(&planeZ[n][y * w], z + y * ppl, w);
+        }
+    }
     newFrame = true;
 }
 static void audio_sample(int16_t l, int16_t r) { pushIn(l, r); }
@@ -257,6 +289,7 @@ static bool loadGame(const std::string &name) {
     keep.swap(rom);
     retro_game_info gi = {path.c_str(), keep.data(), keep.size(), nullptr};
     if (!retro_load_game(&gi)) { LOGE("core refused %s", name.c_str()); retro_deinit(); return false; }
+    snes3d_enable_planes(1);
     gameLoaded = true; gameName = name; gamePath = path;
     retro_system_av_info av; retro_get_system_av_info(&av);
     avFps = av.timing.fps; avRate = av.timing.sample_rate;
@@ -267,7 +300,7 @@ static bool loadGame(const std::string &name) {
     Settings global = cfg;
     loadSettings(saveDir + "/" + stem() + ".cfg");
     cfg.screenWidth = global.screenWidth; cfg.distance = global.distance;  // screen placement stays global
-    LOGI("loaded %s (%.3f fps, %.1f Hz)", name.c_str(), avFps, avRate);
+    trace("loaded %s (%.3f fps, %.1f Hz)", name.c_str(), avFps, avRate);
     return true;
 }
 
@@ -275,7 +308,7 @@ static bool loadGame(const std::string &name) {
 static const int MENU_W = 1024, MENU_H = 640, CELL_W = 16, CELL_H = 32;
 static const int COLS = MENU_W / CELL_W, ROWS = MENU_H / CELL_H;
 static std::vector<uint32_t> menuPixels(MENU_W * MENU_H);
-enum MenuMode { MENU_NONE, MENU_ROMS, MENU_PAUSE };
+enum MenuMode { MENU_NONE, MENU_ROMS, MENU_PAUSE, MENU_HELP };
 static MenuMode menuMode = MENU_ROMS;
 static std::vector<std::string> roms;
 static int romSel = 0, pauseSel = 0;
@@ -313,7 +346,23 @@ static void drawText(int col, int row, const std::string &s, uint32_t color, uin
 }
 static const uint32_t C_BG = 0xff201812, C_TEXT = 0xffe0e0e0, C_DIM = 0xff909090, C_HI = 0xff30c0ff, C_SELBG = 0xff604020;
 
-static const char *pauseItems[] = {"Resume", "3D depth", "Convergence", "3D on/off", "Mode 7 floor depth", "Swap eyes",
+static const char *helpLines[] = {
+    "CONTROLS (Touch controllers)",
+    "",
+    "Move ............ either thumbstick",
+    "SNES B (jump) ... right A",
+    "SNES A .......... right B",
+    "SNES Y (run) .... right trigger",
+    "SNES X .......... left trigger",
+    "SNES L / R ...... left grip / right grip",
+    "Start ........... left menu button or right stick click",
+    "Select .......... left X or left stick click",
+    "SNES3D menu ..... left Y",
+    "",
+    "Bluetooth gamepads work too (menu: Select+Start).",
+    "",
+    "Press any button to play."};
+static const char *pauseItems[] = {"Resume", "Controls", "3D depth", "Convergence", "3D on/off", "Mode 7 floor depth", "Swap eyes",
                                    "Screen size", "Screen distance", "Save state", "Load state", "Choose game"};
 static const int PAUSE_N = sizeof(pauseItems) / sizeof(pauseItems[0]);
 
@@ -346,20 +395,24 @@ static void renderMenu() {
         for (int i = 0; i < PAUSE_N; i++) {
             std::string v;
             switch (i) {
-            case 1: snprintf(buf, sizeof buf, "%.2f", cfg.strength); v = buf; break;
-            case 2: snprintf(buf, sizeof buf, "%+.1f", cfg.convergence); v = buf; break;
-            case 3: v = cfg.stereoOn ? "on" : "off"; break;
-            case 4: v = cfg.mode7Ramp ? "on" : "off"; break;
-            case 5: v = cfg.swapEyes ? "swapped" : "normal"; break;
-            case 6: snprintf(buf, sizeof buf, "%.1f m", cfg.screenWidth); v = buf; break;
-            case 7: snprintf(buf, sizeof buf, "%.1f m", cfg.distance); v = buf; break;
+            case 2: snprintf(buf, sizeof buf, "%.2f", cfg.strength); v = buf; break;
+            case 3: snprintf(buf, sizeof buf, "%+.1f", cfg.convergence); v = buf; break;
+            case 4: v = cfg.stereoOn ? "on" : "off"; break;
+            case 5: v = cfg.mode7Ramp ? "on" : "off"; break;
+            case 6: v = cfg.swapEyes ? "swapped" : "normal"; break;
+            case 7: snprintf(buf, sizeof buf, "%.1f m", cfg.screenWidth); v = buf; break;
+            case 8: snprintf(buf, sizeof buf, "%.1f m", cfg.distance); v = buf; break;
             }
             bool sel = i == pauseSel;
             if (sel) for (int x = 0; x < MENU_W; x++) for (int y = 0; y < CELL_H; y++) menuPixels[((i + 2) * CELL_H + y) * MENU_W + x] = C_SELBG;
             drawText(2, i + 2, pauseItems[i], sel ? 0xffffffff : C_TEXT);
-            if (!v.empty()) drawText(26, i + 2, (i >= 1 && i <= 7 ? "< " : "") + v + (i >= 1 && i <= 7 ? " >" : ""), sel ? 0xffffffff : C_TEXT);
+            if (!v.empty()) drawText(26, i + 2, (i >= 2 && i <= 8 ? "< " : "") + v + (i >= 2 && i <= 8 ? " >" : ""), sel ? 0xffffffff : C_TEXT);
         }
         drawText(1, ROWS - 1, "L stick: move  R stick: change  A: select  B: resume", C_DIM);
+    }
+    else if (menuMode == MENU_HELP) {
+        for (int i = 0; i < (int)(sizeof(helpLines) / sizeof(helpLines[0])) && i < ROWS; i++)
+            drawText(1, i + 1, helpLines[i], i == 0 ? C_HI : C_TEXT);
     }
     if (!toast.empty() && nowSec() < toastUntil) drawText(1, ROWS - 2, toast, C_HI);
     menuDirty = false;
@@ -381,9 +434,9 @@ static XrSession session = XR_NULL_HANDLE;
 static XrSpace localSpace = XR_NULL_HANDLE, viewSpace = XR_NULL_HANDLE;
 static XrSessionState sessionState = XR_SESSION_STATE_UNKNOWN;
 static bool sessionRunning = false, hasRefreshExt = false;
-static Swap gameSwap, menuSwap;
+static Swap menuSwap;
 static XrActionSet actionSet;
-static XrAction actA, actB, actX, actY, actTrigL, actTrigR, actGripL, actGripR, actMenu, actStickL, actStickR;
+static XrAction actA, actB, actX, actY, actTrigL, actTrigR, actGripL, actGripR, actMenu, actStickL, actStickR, actClickL, actClickR;
 static XrPath handL, handR;
 
 static XrPath path(const char *s) { XrPath p; xrStringToPath(instance, s, &p); return p; }
@@ -465,6 +518,8 @@ static void initActions() {
     actMenu = makeAction("menu", XR_ACTION_TYPE_BOOLEAN_INPUT);
     actStickL = makeAction("stick_left", XR_ACTION_TYPE_VECTOR2F_INPUT);
     actStickR = makeAction("stick_right", XR_ACTION_TYPE_VECTOR2F_INPUT);
+    actClickL = makeAction("stick_click_left", XR_ACTION_TYPE_BOOLEAN_INPUT);
+    actClickR = makeAction("stick_click_right", XR_ACTION_TYPE_BOOLEAN_INPUT);
     std::vector<XrActionSuggestedBinding> b = {
         {actA, path("/user/hand/right/input/a/click")},
         {actB, path("/user/hand/right/input/b/click")},
@@ -477,6 +532,8 @@ static void initActions() {
         {actMenu, path("/user/hand/left/input/menu/click")},
         {actStickL, path("/user/hand/left/input/thumbstick")},
         {actStickR, path("/user/hand/right/input/thumbstick")},
+        {actClickL, path("/user/hand/left/input/thumbstick/click")},
+        {actClickR, path("/user/hand/right/input/thumbstick/click")},
     };
     XrInteractionProfileSuggestedBinding sb{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
     sb.interactionProfile = path("/interaction_profiles/oculus/touch_controller");
@@ -506,7 +563,17 @@ static void pollActions() {
     XrActiveActionSet as{actionSet, XR_NULL_PATH};
     XrActionsSyncInfo si{XR_TYPE_ACTIONS_SYNC_INFO};
     si.countActiveActionSets = 1; si.activeActionSets = &as;
-    if (XR_FAILED(xrSyncActions(session, &si))) return;
+    XrResult sr0 = xrSyncActions(session, &si);
+    static XrResult lastSync = XR_SUCCESS;
+    if (sr0 != lastSync) { trace("xrSyncActions -> %d", (int)sr0); lastSync = sr0; }
+    {
+        XrActionStateGetInfo gi{XR_TYPE_ACTION_STATE_GET_INFO}; gi.action = actA;
+        XrActionStateBoolean st{XR_TYPE_ACTION_STATE_BOOLEAN};
+        xrGetActionStateBoolean(session, &gi, &st);
+        static int lastActive = -1;
+        if ((int)st.isActive != lastActive) { trace("controller actions %s", st.isActive ? "active" : "INACTIVE"); lastActive = st.isActive; }
+    }
+    if (XR_FAILED(sr0)) return;
     XrVector2f sl = getStick(actStickL), sr = getStick(actStickR);
     float sx = fabsf(sl.x) > fabsf(sr.x) ? sl.x : sr.x, sy = fabsf(sl.y) > fabsf(sr.y) ? sl.y : sr.y;
     navX = sr.x; navY = sl.y;  // menu: left stick moves up/down, right stick changes values / pages
@@ -518,8 +585,8 @@ static void pollActions() {
     xrButtons[B_X] = getFloat(actTrigL) > 0.5f;
     xrButtons[B_L] = getFloat(actGripL) > 0.5f;
     xrButtons[B_R] = getFloat(actGripR) > 0.5f;
-    xrButtons[B_SELECT] = getBool(actX);
-    xrButtons[B_START] = getBool(actMenu);
+    xrButtons[B_SELECT] = getBool(actX) || getBool(actClickL);
+    xrButtons[B_START] = getBool(actMenu) || getBool(actClickR);
     xrButtons[B_UP] = sy > 0.5f; xrButtons[B_DOWN] = sy < -0.5f;
     xrButtons[B_LEFT] = sx < -0.5f; xrButtons[B_RIGHT] = sx > 0.5f;
     xrMenu = getBool(actY);
@@ -576,7 +643,25 @@ static bool initXR(android_app *app) {
     rs.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
     XRCHECK(xrCreateReferenceSpace(session, &rs, &viewSpace));
 
-    if (!makeSwap(gameSwap, 2 * stereo::EYE_W, 960) || !makeSwap(menuSwap, MENU_W, MENU_H)) return false;
+    if (!makeSwap(menuSwap, MENU_W, MENU_H)) return false;
+    {
+        uint32_t vc = 0;
+        xrEnumerateViewConfigurationViews(instance, systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &vc, nullptr);
+        std::vector<XrViewConfigurationView> vcv(vc, {XR_TYPE_VIEW_CONFIGURATION_VIEW});
+        xrEnumerateViewConfigurationViews(instance, systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, vc, &vc, vcv.data());
+        if (vc < 2 || !renderer.init()) { LOGE("renderer init failed"); return false; }
+        for (int eye = 0; eye < 2; eye++) {
+            Swap s;
+            if (!makeSwap(s, (int)vcv[eye].recommendedImageRectWidth, (int)vcv[eye].recommendedImageRectHeight)) return false;
+            render::Eye &e = renderer.eyes[eye];
+            e.swap = s.handle; e.w = s.w; e.h = s.h; e.images = s.images;
+            e.fbos.assign(e.images.size(), 0);
+            glGenRenderbuffers(1, &e.depth);
+            glBindRenderbuffer(GL_RENDERBUFFER, e.depth);
+            glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, e.w, e.h);
+            LOGI("eye %d: %dx%d", eye, e.w, e.h);
+        }
+    }
     initActions();
     return true;
 }
@@ -604,7 +689,7 @@ static void handleXrEvents(android_app *app) {
         if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
             auto *sc = (XrEventDataSessionStateChanged *)&ev;
             sessionState = sc->state;
-            LOGI("session state %d", (int)sessionState);
+            trace("session state %d", (int)sessionState);
             if (sessionState == XR_SESSION_STATE_READY) {
                 XrSessionBeginInfo bi{XR_TYPE_SESSION_BEGIN_INFO};
                 bi.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -662,6 +747,10 @@ static void menuInput(const bool *b) {
     trigHeld = trigRValue > 0.3f ? (trigHeld || trigRValue > 0.85f) : false;
     bool back = b[B_A] && !backHeld;
     backHeld = b[B_A];
+    if (menuMode == MENU_HELP) {
+        if (ok || back || fire) { menuMode = MENU_NONE; menuDirty = true; }
+        return;
+    }
     if (menuMode == MENU_ROMS) {
         if (roms.empty()) { if (ok) scanRoms(); menuDirty |= ok; return; }
         int page = ROWS - 3;
@@ -670,7 +759,7 @@ static void menuInput(const bool *b) {
         if (left) romSel = std::max(0, romSel - page);
         if (right) romSel = std::min((int)roms.size() - 1, romSel + page);
         if (ok) {
-            if (loadGame(roms[romSel])) menuMode = MENU_NONE;
+            if (loadGame(roms[romSel])) { menuMode = MENU_HELP; resetMenuInput(); }
             else showToast("Could not load that ROM");
         }
         if (back && gameLoaded) menuMode = MENU_PAUSE;
@@ -683,33 +772,34 @@ static void menuInput(const bool *b) {
     int delta = right ? 1 : left ? -1 : 0;
     if (delta) {
         switch (pauseSel) {
-        case 1: cfg.strength = std::clamp(cfg.strength + 0.25f * delta, 0.0f, 3.0f); break;
-        case 2: cfg.convergence += 0.5f * delta; break;
-        case 3: cfg.stereoOn ^= 1; break;
-        case 4: cfg.mode7Ramp ^= 1; break;
-        case 5: cfg.swapEyes ^= 1; break;
-        case 6: cfg.screenWidth = std::clamp(cfg.screenWidth + 0.2f * delta, 0.8f, 6.0f); break;
-        case 7: cfg.distance = std::clamp(cfg.distance + 0.2f * delta, 0.8f, 6.0f); break;
+        case 2: cfg.strength = std::clamp(cfg.strength + 0.25f * delta, 0.0f, 3.0f); break;
+        case 3: cfg.convergence += 0.5f * delta; break;
+        case 4: cfg.stereoOn ^= 1; break;
+        case 5: cfg.mode7Ramp ^= 1; break;
+        case 6: cfg.swapEyes ^= 1; break;
+        case 7: cfg.screenWidth = std::clamp(cfg.screenWidth + 0.2f * delta, 0.8f, 6.0f); break;
+        case 8: cfg.distance = std::clamp(cfg.distance + 0.2f * delta, 0.8f, 6.0f); break;
         }
-        newFrame = frame.valid;  // re-warp the paused frame with the new settings
+        newFrame = frame.valid;  // rebuild the paused frame with the new settings
     }
     if (ok) {
         switch (pauseSel) {
         case 0: menuMode = MENU_NONE; break;
-        case 3: cfg.stereoOn ^= 1; newFrame = frame.valid; break;
-        case 4: cfg.mode7Ramp ^= 1; newFrame = frame.valid; break;
-        case 5: cfg.swapEyes ^= 1; newFrame = frame.valid; break;
-        case 8: {
+        case 1: menuMode = MENU_HELP; break;
+        case 4: cfg.stereoOn ^= 1; newFrame = frame.valid; break;
+        case 5: cfg.mode7Ramp ^= 1; newFrame = frame.valid; break;
+        case 6: cfg.swapEyes ^= 1; newFrame = frame.valid; break;
+        case 9: {
             std::vector<uint8_t> s(retro_serialize_size());
             if (retro_serialize(s.data(), s.size())) { writeFile(saveDir + "/" + stem() + ".state", s.data(), s.size()); savePause("State saved"); }
             break;
         }
-        case 9: {
+        case 10: {
             std::vector<uint8_t> s;
             savePause(readFile(saveDir + "/" + stem() + ".state", s) && retro_unserialize(s.data(), s.size()) ? "State loaded" : "No saved state");
             break;
         }
-        case 10: scanRoms(); menuMode = MENU_ROMS; break;
+        case 11: scanRoms(); menuMode = MENU_ROMS; break;
         }
     }
     if (back) menuMode = MENU_NONE;
@@ -726,14 +816,11 @@ void android_main(android_app *app) {
     romDir = filesDir + "/roms"; saveDir = filesDir + "/saves"; sysDir = filesDir + "/system";
     mkdir(filesDir.c_str(), 0775); mkdir(romDir.c_str(), 0775); mkdir(saveDir.c_str(), 0775); mkdir(sysDir.c_str(), 0775);
     loadSettings(filesDir + "/settings.cfg");
-    LOGI("ROM folder: %s", romDir.c_str());
+    traceFile = fopen((filesDir + "/input.log").c_str(), "a");
+    trace("---- start, ROM folder %s", romDir.c_str());
     scanRoms();
 
     if (!initXR(app)) { LOGE("OpenXR init failed"); ANativeActivity_finish(app->activity); }
-    static uint32_t lut[65536];
-    stereo::makeLut(lut, true);
-    std::vector<uint32_t> sbs;
-    unsigned outH = 224 * 4;
     startAudio();
     {   // test hook: files/autostart.txt names a ROM to load immediately (file is consumed)
         std::vector<uint8_t> a;
@@ -751,13 +838,36 @@ void android_main(android_app *app) {
     double lastEmu = nowSec();
     while (!app->destroyRequested) {
         int events; android_poll_source *source;
-        while (ALooper_pollOnce(sessionRunning || !instance ? 0 : 100, nullptr, &events, (void **)&source) >= 0) {
+        while (ALooper_pollOnce(sessionRunning || !instance || gameLoaded ? 0 : 100, nullptr, &events, (void **)&source) >= 0) {
             if (source) source->process(app, source);
             if (app->destroyRequested) break;
         }
         if (app->destroyRequested || !instance) break;
         handleXrEvents(app);
-        if (!sessionRunning) continue;
+        if (!sessionRunning) {
+            // debug: files/debug_headless keeps the game running with the headset off (for adb tests)
+            static bool headless = access((filesDir + "/debug_headless").c_str(), F_OK) == 0;
+            if (headless && gameLoaded && menuMode == MENU_NONE) {
+                bool in[B_COUNT];
+                for (int i = 0; i < B_COUNT; i++) in[i] = padButtons[i];
+                in[B_UP] |= padAxisY < -0.5f; in[B_DOWN] |= padAxisY > 0.5f;
+                in[B_LEFT] |= padAxisX < -0.5f; in[B_RIGHT] |= padAxisX > 0.5f;
+                memcpy(joypad, in, sizeof joypad);
+                double t = nowSec();
+                while (t - lastEmu >= 1.0 / avFps) { retro_run(); lastEmu += 1.0 / avFps; if (t - lastEmu > 0.5) lastEmu = t; }
+                usleep(2000);
+                if (access((filesDir + "/dump_request").c_str(), F_OK) == 0 && frame.valid) {
+                    remove((filesDir + "/dump_request").c_str());
+                    std::vector<uint8_t> ppm;
+                    char hdr[64]; int n = snprintf(hdr, sizeof hdr, "P6 %u %u 255\n", frame.w, frame.h);
+                    ppm.insert(ppm.end(), hdr, hdr + n);
+                    for (uint16_t c : frame.rgb565) { ppm.push_back(((c >> 11) & 31) * 255 / 31); ppm.push_back(((c >> 5) & 63) * 255 / 63); ppm.push_back((c & 31) * 255 / 31); }
+                    writeFile(filesDir + "/frame.ppm", ppm.data(), ppm.size());
+                    LOGI("frame dumped");
+                }
+            }
+            continue;
+        }
 
         XrFrameWaitInfo fwi{XR_TYPE_FRAME_WAIT_INFO};
         XrFrameState fs{XR_TYPE_FRAME_STATE};
@@ -770,6 +880,14 @@ void android_main(android_app *app) {
         for (int i = 0; i < B_COUNT; i++) all[i] = xrButtons[i] || padButtons[i];
         all[B_UP] |= padAxisY < -0.5f; all[B_DOWN] |= padAxisY > 0.5f;
         all[B_LEFT] |= padAxisX < -0.5f; all[B_RIGHT] |= padAxisX > 0.5f;
+        {
+            static const char *names[B_COUNT] = {"B", "Y", "Select", "Start", "Up", "Down", "Left", "Right", "A", "X", "L", "R"};
+            static bool last[B_COUNT];
+            static bool lastMenu;
+            for (int i = 0; i < B_COUNT; i++)
+                if (all[i] != last[i]) { trace("input SNES %s %s (menu mode %d, game %d)", names[i], all[i] ? "down" : "up", (int)menuMode, (int)gameLoaded); last[i] = all[i]; }
+            if (xrMenu != lastMenu) { trace("input SNES3D-menu button %s", xrMenu ? "down" : "up"); lastMenu = xrMenu; }
+        }
         bool menuBtn = xrMenu || padMenu || (padButtons[B_SELECT] && padButtons[B_START]);
         if (menuBtn && !prevMenuBtn) {
             if (menuMode == MENU_NONE) { menuMode = MENU_PAUSE; pauseSel = 0; saveSram(); }
@@ -799,16 +917,19 @@ void android_main(android_app *app) {
             statRuns += runs;
         }
 
-        // eye separation for the comfort clamp
+        // eye poses in the room (LOCAL space); their separation drives the comfort clamp
+        XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+        bool haveViews = false;
         float ipd = 0.063f;
         {
             XrViewLocateInfo vli{XR_TYPE_VIEW_LOCATE_INFO};
             vli.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-            vli.displayTime = fs.predictedDisplayTime; vli.space = viewSpace;
+            vli.displayTime = fs.predictedDisplayTime; vli.space = localSpace;
             XrViewState vs{XR_TYPE_VIEW_STATE};
-            XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
             uint32_t vn = 0;
-            if (XR_SUCCEEDED(xrLocateViews(session, &vli, &vs, 2, &vn, views)) && vn == 2) {
+            if (XR_SUCCEEDED(xrLocateViews(session, &vli, &vs, 2, &vn, views)) && vn == 2 &&
+                (vs.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) && (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) {
+                haveViews = true;
                 float dx = views[1].pose.position.x - views[0].pose.position.x;
                 float dy = views[1].pose.position.y - views[0].pose.position.y;
                 float dz = views[1].pose.position.z - views[0].pose.position.z;
@@ -818,18 +939,11 @@ void android_main(android_app *app) {
         }
 
         if (newFrame && frame.valid) {
-            // One SNES pixel spans screenWidth/256 metres. Scale so the deepest layer (~8.5 px) lands at
-            // 80% of the eye separation, and never let any shift reach 90% of it (no eye divergence).
-            float pxM = cfg.screenWidth / 256.0f;
-            float autoScale = (0.80f * ipd / pxM) / 8.5f;
-            stereo::Params sp;
-            sp.strength = cfg.strength * autoScale;
-            sp.convergence = cfg.convergence * autoScale;
-            sp.maxFar = 0.90f * ipd / pxM;
-            sp.maxNear = 8.0f;
-            sp.enabled = cfg.stereoOn; sp.mode7Ramp = cfg.mode7Ramp; sp.swapEyes = cfg.swapEyes;
-            outH = std::min(stereo::build(frame, sp, lut, sbs), (unsigned)gameSwap.h);
-            uploadSwap(gameSwap, sbs.data(), gameSwap.w, outH);
+            diorama::Input din{frame.w, frame.h, frame.rgb565.data(), frame.layers.data(), frame.depths.data(), {}, {}};
+            for (int n = 0; n < 5; n++) { din.planeColor[n] = planeColor[n].data(); din.planeZ[n] = planeZ[n].data(); }
+            sheets.mode7Ramp = cfg.mode7Ramp;
+            sheets.build(din);
+            renderer.upload(sheets, frame.w, frame.h);
             newFrame = false;
         }
         if (menuMode != MENU_NONE && (menuDirty || (!toast.empty() && nowSec() > toastUntil))) {
@@ -838,27 +952,45 @@ void android_main(android_app *app) {
             uploadSwap(menuSwap, menuPixels.data(), MENU_W, MENU_H);
         }
 
-        XrCompositionLayerQuad quads[3];
-        const XrCompositionLayerBaseHeader *layers[3];
+        XrCompositionLayerProjection proj{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+        XrCompositionLayerProjectionView pviews[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
+        XrCompositionLayerQuad quads[1];
+        const XrCompositionLayerBaseHeader *layers[2];
         uint32_t nl = 0;
-        if (fs.shouldRender && gameLoaded && frame.valid) {
-            float w = cfg.screenWidth, h = w * 3.0f / 4.0f;
+        if (fs.shouldRender && haveViews) {
+            // One SNES pixel spans screenWidth/256 metres. Scale so the deepest sheet (~8.5 px) lands at
+            // 80% of the eye separation; the shader never lets a shift reach 90% of it (no divergence).
+            float pxM = cfg.screenWidth / 256.0f;
+            float autoScale = (0.80f * ipd / pxM) / 8.5f;
+            float screen[4] = {cfg.screenWidth, cfg.screenWidth * 3.0f / 4.0f, cfg.distance, pxM};
+            float depth[4] = {ipd, cfg.stereoOn ? cfg.strength * autoScale : 0.0f, cfg.stereoOn ? cfg.convergence * autoScale : 0.0f, 0.0f};
             for (int eye = 0; eye < 2; eye++) {
-                XrCompositionLayerQuad &q = quads[nl];
-                q = {XR_TYPE_COMPOSITION_LAYER_QUAD};
-                q.space = localSpace;
-                q.eyeVisibility = eye == 0 ? XR_EYE_VISIBILITY_LEFT : XR_EYE_VISIBILITY_RIGHT;
-                q.subImage.swapchain = gameSwap.handle;
-                q.subImage.imageRect = {{eye * stereo::EYE_W, 0}, {stereo::EYE_W, (int32_t)outH}};
-                q.pose.orientation.w = 1;
-                q.pose.position = {0.0f, 0.0f, -cfg.distance};
-                q.size = {w, h};
-                layers[nl] = (XrCompositionLayerBaseHeader *)&q;
-                nl++;
+                render::Eye &e = renderer.eyes[eye];
+                uint32_t idx;
+                XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+                xrAcquireSwapchainImage(e.swap, &ai, &idx);
+                XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+                wi.timeout = XR_INFINITE_DURATION;
+                xrWaitSwapchainImage(e.swap, &wi);
+                // swapped eyes: each eye is drawn from the other eye's position
+                const XrView &v = views[cfg.swapEyes ? 1 - eye : eye];
+                XrView drawView = views[eye];
+                drawView.pose.position = v.pose.position;
+                renderer.drawEye(eye, idx, drawView, screen, depth, gameLoaded && frame.valid);
+                XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                xrReleaseSwapchainImage(e.swap, &ri);
+                pviews[eye].pose = views[eye].pose;
+                pviews[eye].fov = views[eye].fov;
+                pviews[eye].subImage.swapchain = e.swap;
+                pviews[eye].subImage.imageRect = {{0, 0}, {e.w, e.h}};
             }
+            proj.space = localSpace;
+            proj.viewCount = 2;
+            proj.views = pviews;
+            layers[nl++] = (XrCompositionLayerBaseHeader *)&proj;
         }
         if (fs.shouldRender && menuMode != MENU_NONE) {
-            XrCompositionLayerQuad &q = quads[nl];
+            XrCompositionLayerQuad &q = quads[0];
             q = {XR_TYPE_COMPOSITION_LAYER_QUAD};
             q.space = localSpace;
             q.eyeVisibility = XR_EYE_VISIBILITY_BOTH;

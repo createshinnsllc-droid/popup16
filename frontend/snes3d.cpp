@@ -17,6 +17,7 @@
 #include <algorithm>
 #include "libretro.h"
 #include "../shared/stereo.h"
+#include "../shared/diorama.h"
 
 // ---------- core binding ----------
 struct Core {
@@ -346,6 +347,10 @@ int main(int argc, char **argv) {
     if (dump) {
         int n = atoi(argv[4]);
         bool scripted = getenv("SNES3D_AUTO") != nullptr;
+        // SNES3D_PLANES=<prefix>: also write each solo layer (BG1-4, OBJ) as <prefix>N.bmp, empty = magenta
+        const char *planePrefix = getenv("SNES3D_PLANES");
+        auto enablePlanes = (void (*)(int))dlsym(core.h, "snes3d_enable_planes");
+        if (planePrefix && enablePlanes) enablePlanes(1);
         for (int i = 0; i < n; i++) { if (scripted) autoFrame = i; core.run(); }
         if (!cur.valid) { fprintf(stderr, "no frame\n"); return 1; }
         buildSbs();
@@ -361,6 +366,54 @@ int main(int argc, char **argv) {
                 px[0] = c & 255; px[1] = (c >> 8) & 255; px[2] = (c >> 16) & 255;
             }
         writeFile(argv[5], bmp.data(), bmp.size());
+        if (planePrefix && enablePlanes) {
+            auto pc = (const uint16_t *(*)(int))dlsym(core.h, "snes3d_get_plane_color");
+            auto pz = (const uint8_t *(*)(int))dlsym(core.h, "snes3d_get_plane_z");
+            unsigned w = cur.w, h = cur.h, ppl = 512;  // GFX.Pitch / 2 (MAX_SNES_WIDTH)
+            int rb = (w * 3 + 3) & ~3;
+            for (int n = 0; n < 5; n++) {
+                std::vector<uint8_t> pb(54 + (size_t)rb * h, 0);
+                auto p32 = [&](int o, uint32_t v) { memcpy(&pb[o], &v, 4); };
+                pb[0] = 'B'; pb[1] = 'M'; p32(2, (uint32_t)pb.size()); p32(10, 54); p32(14, 40);
+                p32(18, w); p32(22, h); pb[26] = 1; pb[28] = 24; p32(34, (uint32_t)(rb * h));
+                const uint16_t *c = pc(n); const uint8_t *z = pz(n);
+                int count = 0;
+                for (unsigned y = 0; y < h; y++)
+                    for (unsigned x = 0; x < w; x++) {
+                        uint8_t *px = &pb[54 + (size_t)(h - 1 - y) * rb + x * 3];
+                        uint32_t v = z[y * ppl + x] ? lut565[c[y * ppl + x]] : 0xffff00ff;
+                        count += z[y * ppl + x] != 0;
+                        px[0] = v & 255; px[1] = (v >> 8) & 255; px[2] = (v >> 16) & 255;
+                    }
+                writeFile(std::string(planePrefix) + std::to_string(n) + ".bmp", pb.data(), pb.size());
+                printf("plane %d: %d px\n", n, count);
+            }
+            // diorama check: stacking the sheets far to near, seen head-on, must give back the frame
+            std::vector<uint16_t> pcol[5]; std::vector<uint8_t> pzz[5];
+            diorama::Input din{w, h, cur.rgb565.data(), cur.layers.data(), cur.depths.data(), {}, {}};
+            for (int n = 0; n < 5; n++) {
+                pcol[n].resize(w * h); pzz[n].resize(w * h);
+                for (unsigned y = 0; y < h; y++) {
+                    memcpy(&pcol[n][y * w], pc(n) + y * ppl, w * 2);
+                    memcpy(&pzz[n][y * w], pz(n) + y * ppl, w);
+                }
+                din.planeColor[n] = pcol[n].data(); din.planeZ[n] = pzz[n].data();
+            }
+            static diorama::Builder db;
+            db.build(din);
+            std::vector<uint32_t> out(w * h, 0);
+            for (const auto &q : db.quads)
+                for (int x = (int)q.u0; x < (int)q.u1; x++) {
+                    uint32_t t = db.slice((int)q.slice)[(int)q.v * diorama::TEX_W + x];
+                    if ((t >> 24) == (uint32_t)q.z) out[(int)q.v * w + x] = t & 0xffffff;
+                }
+            int bad = 0;
+            for (size_t i = 0; i < out.size(); i++) bad += out[i] != (db.lut[cur.rgb565[i]] & 0xffffff);
+            int sheets = 0; { std::vector<int> seen; for (auto &q : db.quads) { int k = (int)q.slice * 256 + (int)q.z; if (std::find(seen.begin(), seen.end(), k) == seen.end()) seen.push_back(k); } sheets = (int)seen.size(); }
+            printf("diorama: %zu quads, %d sheets, head-on mismatch %d of %zu px\n", db.quads.size(), sheets, bad, out.size());
+            if (getenv("SNES3D_SHEETS"))
+                for (auto &q : db.quads) if (q.v == (float)(h / 2)) printf("  row %d slice %d z %d disparity %+.2f span %d-%d\n", (int)q.v, (int)q.slice, (int)q.z, q.disparity, (int)q.u0, (int)q.u1);
+        }
         if (getenv("SNES3D_DEBUG")) {
             std::vector<int> pairs(8 * 256, 0);
             for (size_t i = 0; i < cur.layers.size(); i++) pairs[(cur.layers[i] & 7) * 256 + cur.depths[i]]++;
