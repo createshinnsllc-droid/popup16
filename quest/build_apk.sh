@@ -7,7 +7,7 @@ SDK=$HOME/Library/Android/sdk
 NDK=$SDK/ndk/27.2.12479018
 BT=$SDK/build-tools/34.0.0
 cmake -S . -B build/cmake -G Ninja -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
-  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 -DANDROID_STL=c++_static -DCMAKE_BUILD_TYPE=Release >/dev/null
+  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-32 -DANDROID_STL=c++_static -DCMAKE_BUILD_TYPE=Release >/dev/null
 cmake --build build/cmake
 rm -rf build/apk && mkdir -p build/apk/lib/arm64-v8a
 cp build/cmake/libpopup16quest.so third_party/oxr/prefab/modules/openxr_loader/libs/android.arm64-v8a/libopenxr_loader.so build/apk/lib/arm64-v8a/

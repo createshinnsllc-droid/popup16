@@ -19,6 +19,7 @@
 #include "../shared/stereo.h"
 #include "../shared/diorama.h"
 #include "../shared/rewind.h"
+#include "../shared/png.h"
 
 // ---------- core binding ----------
 struct Core {
@@ -261,6 +262,8 @@ int main(int argc, char **argv) {
     bool startWindowed = argc > 3 && std::string(argv[3]) == "--window";
     // --dump <frames> <out.bmp>: headless run, writes the side-by-side frame and exits (for testing)
     bool dump = argc > 5 && std::string(argv[3]) == "--dump";
+    // --cover <frames> <out.png>: plays the opening without input and saves the most colourful frame
+    bool cover = argc > 5 && std::string(argv[3]) == "--cover";
 
     const char *home = getenv("HOME");
     std::string base = std::string(home ? home : ".") + "/Library/Application Support/PopUp16";
@@ -344,6 +347,44 @@ int main(int argc, char **argv) {
     core.get_system_av_info(&av);
 
     stereo::makeLut(lut565, false);
+
+    if (cover) {
+        int n = atoi(argv[4]);
+        std::vector<uint16_t> best;
+        unsigned bw = 0, bh = 0;
+        double bestScore = -1;
+        int bestFrame = 0;
+        for (int i = 0; i < n; i++) {
+            core.run();
+            if (i < 600 || i % 30 || !cur.valid) continue;  // publisher logos fill the first ~10 s
+            // score: distinct colours (title art is colourful) weighted by how much of the screen is lit
+            static std::vector<uint8_t> seen(4096);
+            std::fill(seen.begin(), seen.end(), 0);
+            int distinct = 0, lit = 0;
+            for (uint16_t c : cur.rgb565) {
+                int q = ((c >> 12) << 8) | (((c >> 7) & 15) << 4) | ((c >> 1) & 15);
+                if (!seen[q]) { seen[q] = 1; distinct++; }
+                int r = c >> 11, g = (c >> 5) & 63, b = c & 31;
+                lit += (r + g / 2 + b) > 12;
+            }
+            double litFrac = (double)lit / cur.rgb565.size();
+            // logos sit on one flat colour; title art fills the screen
+            static std::vector<int> count(4096);
+            std::fill(count.begin(), count.end(), 0);
+            int top = 0;
+            for (uint16_t c : cur.rgb565) {
+                int q = ((c >> 12) << 8) | (((c >> 7) & 15) << 4) | ((c >> 1) & 15);
+                top = std::max(top, ++count[q]);
+            }
+            double flat = (double)top / cur.rgb565.size();
+            double score = std::min(distinct, 400) * (0.15 + litFrac) * (1.0 - flat) * (1.0 - flat);
+            if (score > bestScore) { bestScore = score; best = cur.rgb565; bw = cur.w; bh = cur.h; bestFrame = i; }
+        }
+        if (best.empty()) { fprintf(stderr, "no frame\n"); return 1; }
+        bool ok = png::write565(argv[5], (int)bw, (int)bh, best.data());
+        printf("cover: frame %d score %.0f %ux%u -> %s\n", bestFrame, bestScore, bw, bh, ok ? argv[5] : "WRITE FAILED");
+        return ok ? 0 : 1;
+    }
 
     if (dump) {
         int n = atoi(argv[4]);

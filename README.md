@@ -19,8 +19,11 @@ own depth, like a pop-up book. Move your head and the scene has real parallax.
 - 60 fps emulation on a 120 Hz display; quick resume where you left off.
 - Rewind (hold the left stick in), slow motion and fast speeds, four save slots with pictures.
 - Mixed reality: place the game in your room, carry it, resize it, peek into the pop-up box.
-- Touch controllers or a Bluetooth gamepad; in-headset game list, settings and
-  controls card.
+- **Library:** cover grid with Recent, Favorites and All tabs; playtime and last played per game.
+  Covers are your own: `tools/make_covers.sh <rom folder>` picks the best title-screen frame of
+  each game, any `covers/<game>.png` or `.jpg` you add wins, and games without one get a cover
+  captured after 30 seconds of play. No artwork ships with PopUp16.
+- Touch controllers or a Bluetooth gamepad; in-headset settings and controls card.
 - Mac version (SDL2) with side-by-side output for Virtual Desktop's 3D mode.
 
 ## Build
@@ -41,7 +44,8 @@ Enable developer mode, connect over USB, then:
 quest/install_quest.sh "/path/to/your/game/folder"
 ```
 
-Games go to `Android/data/com.createshinns.popup16/files/roms` on the headset (`.sfc`/`.smc`).
+Games go to `Android/data/com.createshinns.popup16/files/roms` on the headset (`.sfc`/`.smc`);
+covers in `<rom folder>/covers` are copied to `files/covers`.
 `tools/curate_roms.py` can pick one clean USA or English-translated file per game from
 GoodTools-style `.7z` sets.
 

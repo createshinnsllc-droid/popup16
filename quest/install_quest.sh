@@ -26,5 +26,11 @@ if $ADB shell "[ -d $OLD ] && [ ! -e $DEST/../saves/.migrated ]" 2>/dev/null; th
 fi
 echo "copying ROMs from $ROMS ..."
 $ADB push --sync "$ROMS"/*.sfc $DEST/ | tail -1
+if [[ -d "$ROMS/covers" ]]; then  # covers from tools/make_covers.sh or your own art
+  $ADB shell am start -n $PKG/android.app.NativeActivity >/dev/null   # the app creates its covers folder
+  for i in {1..20}; do $ADB shell "[ -d $DEST/../covers ]" && break; sleep 0.5; done
+  echo "copying covers ..."
+  $ADB push --sync "$ROMS"/covers/*(N) $DEST/../covers/ | tail -1
+fi
 $ADB shell am start -n $PKG/android.app.NativeActivity
 echo "started; logs: $ADB logcat -s PopUp16 snes9x OpenXR"

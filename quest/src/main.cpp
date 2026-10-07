@@ -6,6 +6,7 @@
 #include <android/log.h>
 #include <android/input.h>
 #include <android/asset_manager.h>
+#include <android/imagedecoder.h>
 #include <android/keycodes.h>
 #include <android_native_app_glue.h>
 #include <aaudio/AAudio.h>
@@ -35,12 +36,14 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <map>
 
 #include "libretro.h"
 #include "../../shared/stereo.h"
 #include "font8x16.h"
 #include "renderer.h"
 #include "../../shared/rewind.h"
+#include "../../shared/png.h"
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "PopUp16", __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "PopUp16", __VA_ARGS__)
@@ -107,6 +110,12 @@ static void loadSettings(const std::string &path, bool global) {
     fclose(f);
 }
 static void saveGlobal() { saveSettings(filesDir + "/settings.cfg", true); }
+
+// per-game library stats (see the library section)
+struct GameStats { double seconds = 0; long lastPlayed = 0; bool fav = false; };
+static std::map<std::string, GameStats> stats;  // by ROM file name
+static std::string coverDir;
+static void saveStats();
 
 static bool readFile(const std::string &p, std::vector<uint8_t> &out) {
     FILE *f = fopen(p.c_str(), "rb");
@@ -337,6 +346,7 @@ static int16_t input_state(unsigned port, unsigned device, unsigned, unsigned id
 }
 
 static Rewind rewinder;
+static double playedThisLoad = 0;  // seconds of play since the game was loaded (cover capture)
 static int framesSinceSnap = 0;
 static void runFrame() {  // one emulated frame, snapshotting every third for rewind
     retro_run();
@@ -363,6 +373,7 @@ static void saveSram() {
 // quick resume: the running game's state and name are saved whenever the app may go away
 static void saveResume() {
     if (!gameLoaded) return;
+    saveStats();
     std::vector<uint8_t> s(retro_serialize_size());
     if (!s.empty() && retro_serialize(s.data(), s.size())) {
         writeFile(saveDir + "/" + stem() + ".resume", s.data(), s.size());
@@ -410,7 +421,74 @@ static bool loadGame(const std::string &name) {
     if (n && readFile(saveDir + "/" + stem() + ".srm", s) && s.size() == n) memcpy(retro_get_memory_data(RETRO_MEMORY_SAVE_RAM), s.data(), n);
     loadSettings(saveDir + "/" + stem() + ".cfg", false);
     trace("loaded %s (%.3f fps, %.1f Hz)", name.c_str(), avFps, avRate);
+    stats[name].lastPlayed = (long)time(nullptr);
+    saveStats();
+    playedThisLoad = 0;
     return true;
+}
+
+// ---------------------------------------------------------------- library: playtime, favourites, covers
+static void loadStats() {
+    FILE *f = fopen((filesDir + "/library.cfg").c_str(), "r");
+    if (!f) return;
+    char line[512];
+    while (fgets(line, sizeof line, f)) {  // name \t seconds \t last played (unix time) \t favourite
+        char *t1 = strchr(line, '\t'); if (!t1) continue; *t1 = 0;
+        GameStats g; int fav = 0;
+        if (sscanf(t1 + 1, "%lf\t%ld\t%d", &g.seconds, &g.lastPlayed, &fav) >= 2) { g.fav = fav; stats[line] = g; }
+    }
+    fclose(f);
+}
+static void saveStats() {
+    FILE *f = fopen((filesDir + "/library.cfg").c_str(), "w");
+    if (!f) return;
+    for (auto &[n, g] : stats) fprintf(f, "%s\t%.0f\t%ld\t%d\n", n.c_str(), g.seconds, g.lastPlayed, g.fav ? 1 : 0);
+    fclose(f);
+}
+static std::string playtimeText(double sec) {
+    char b[32];
+    if (sec < 60) return sec < 1 ? "new" : "<1m";
+    int m = (int)(sec / 60);
+    if (m < 60) snprintf(b, sizeof b, "%dm", m); else snprintf(b, sizeof b, "%dh %02dm", m / 60, m % 60);
+    return b;
+}
+static std::string lastPlayedText(long t) {
+    if (!t) return "";
+    time_t now = time(nullptr);
+    long days = (long)(now / 86400) - t / 86400;
+    if (days <= 0) return "today";
+    if (days == 1) return "yesterday";
+    char b[32]; time_t tt = t; strftime(b, sizeof b, "%b %d", localtime(&tt));
+    return b;
+}
+// covers: <files>/covers/<game>.png|.jpg (made by tools/make_covers.sh, your own art, or captured in play),
+// decoded once at card size with the platform image decoder
+static const int CARD_W = 224, CARD_H = 196;
+static std::map<std::string, std::vector<uint32_t>> coverCache;
+static const std::vector<uint32_t> *cover(const std::string &rom) {
+    std::string stemName = rom.substr(0, rom.find_last_of('.'));
+    auto it = coverCache.find(stemName);
+    if (it != coverCache.end()) return it->second.empty() ? nullptr : &it->second;
+    if (coverCache.size() > 96) coverCache.clear();
+    std::vector<uint32_t> &px = coverCache[stemName];
+    for (const char *ext : {".png", ".jpg", ".jpeg", ".webp"}) {
+        std::vector<uint8_t> data;
+        if (!readFile(coverDir + "/" + stemName + ext, data)) continue;
+        AImageDecoder *dec = nullptr;
+        if (AImageDecoder_createFromBuffer(data.data(), data.size(), &dec) != ANDROID_IMAGE_DECODER_SUCCESS) continue;
+        AImageDecoder_setAndroidBitmapFormat(dec, ANDROID_BITMAP_FORMAT_RGBA_8888);
+        AImageDecoder_setTargetSize(dec, CARD_W, CARD_H);
+        size_t stride = AImageDecoder_getMinimumStride(dec);
+        std::vector<uint8_t> buf(stride * CARD_H);
+        bool ok = AImageDecoder_decodeImage(dec, buf.data(), stride, buf.size()) == ANDROID_IMAGE_DECODER_SUCCESS;
+        AImageDecoder_delete(dec);
+        if (!ok) continue;
+        px.resize(CARD_W * CARD_H);
+        for (int y = 0; y < CARD_H; y++) memcpy(&px[y * CARD_W], &buf[y * stride], CARD_W * 4);
+        for (auto &c : px) c |= 0xff000000u;
+        return &px;
+    }
+    return nullptr;
 }
 
 // ---------------------------------------------------------------- menu
@@ -423,6 +501,10 @@ static bool slotSaving = true;
 static std::vector<std::string> aboutLines;
 static int aboutTop = 0;
 static MenuMode menuMode = MENU_ROMS;
+enum LibTab { TAB_RECENT, TAB_FAV, TAB_ALL, TAB_N };
+static int libTab = TAB_ALL;
+static std::vector<std::string> libView;  // ROMs in the current tab
+static bool gripHeldL = true, gripHeldR = true, favHeld = true;
 static std::vector<std::string> roms;
 static int romSel = 0, pauseSel = 0;
 static std::string toast;
@@ -441,6 +523,34 @@ static void scanRoms() {
     }
     std::sort(roms.begin(), roms.end(), [](const std::string &a, const std::string &b) { return strcasecmp(a.c_str(), b.c_str()) < 0; });
     romSel = std::clamp(romSel, 0, std::max(0, (int)roms.size() - 1));
+}
+
+static void buildLibView() {
+    libView.clear();
+    for (auto &r : roms) {
+        auto it = stats.find(r);
+        bool played = it != stats.end() && it->second.lastPlayed;
+        bool fav = it != stats.end() && it->second.fav;
+        if (libTab == TAB_ALL || (libTab == TAB_RECENT && played) || (libTab == TAB_FAV && fav)) libView.push_back(r);
+    }
+    if (libTab == TAB_RECENT)
+        std::stable_sort(libView.begin(), libView.end(), [](const std::string &a, const std::string &b) { return stats[a].lastPlayed > stats[b].lastPlayed; });
+    romSel = std::clamp(romSel, 0, std::max(0, (int)libView.size() - 1));
+}
+
+// small text: the 8x16 font at 1x, placed in pixels
+static void drawSmall(int px, int py, const std::string &s, uint32_t color) {
+    for (size_t i = 0; i < s.size(); i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 32 || c > 126) c = '?';
+        const unsigned char *g = kFont8x16[c - 32];
+        for (int y = 0; y < 16; y++)
+            for (int x = 0; x < 8; x++) {
+                int X = px + (int)i * 8 + x, Y = py + y;
+                if (X < 0 || Y < 0 || X >= MENU_W || Y >= MENU_H) continue;
+                if (g[y] & (0x80 >> x)) menuPixels[Y * MENU_W + X] = color;
+            }
+    }
 }
 
 static void drawText(int col, int row, const std::string &s, uint32_t color, uint32_t bg = 0) {
@@ -545,24 +655,62 @@ static void renderMenu() {
     std::fill(menuPixels.begin(), menuPixels.end(), C_BG);
     char buf[160];
     if (menuMode == MENU_ROMS) {
-        drawText(1, 0, "PopUp16 - choose a game", C_HI);
-        if (roms.empty()) {
-            drawText(1, 2, "No ROMs found. Copy .sfc files to:", C_TEXT);
-            drawText(1, 3, romDir.substr(0, COLS - 2), C_DIM);
-        } else {
-            int visible = ROWS - 3;
-            int first = std::clamp(romSel - visible / 2, 0, std::max(0, (int)roms.size() - visible));
-            for (int i = 0; i < visible && first + i < (int)roms.size(); i++) {
-                int idx = first + i;
-                std::string n = roms[idx].substr(0, roms[idx].find_last_of('.'));
-                if ((int)n.size() > COLS - 4) n = n.substr(0, COLS - 4);
-                bool sel = idx == romSel;
-                if (sel) for (int x = 0; x < MENU_W; x++) for (int y = 0; y < CELL_H; y++) menuPixels[((i + 2) * CELL_H + y) * MENU_W + x] = C_SELBG;
-                drawText(2, i + 2, n, sel ? 0xffffffff : C_TEXT);
-            }
-            snprintf(buf, sizeof buf, "%d/%d  stick: move  A/trigger: play  B: back", romSel + 1, (int)roms.size());
-            drawText(1, ROWS - 1, buf, C_DIM);
+        static const char *tabs[TAB_N] = {"Recent", "Favorites", "All games"};
+        drawText(1, 0, "PopUp16", C_HI);
+        int tx = 12;
+        for (int t = 0; t < TAB_N; t++) {
+            std::string label = std::string(" ") + tabs[t] + " ";
+            if (t == libTab) for (int y = 2; y < CELL_H - 2; y++) for (int x = tx * CELL_W; x < (tx + (int)label.size()) * CELL_W; x++) menuPixels[y * MENU_W + x] = C_SELBG;
+            drawText(tx, 0, label, t == libTab ? 0xffffffff : C_DIM);
+            tx += (int)label.size() + 1;
         }
+        if (roms.empty()) {
+            drawText(1, 3, "No games found. Copy .sfc files to:", C_TEXT);
+            drawText(1, 4, romDir.substr(0, COLS - 2), C_DIM);
+        } else if (libView.empty()) {
+            drawText(1, 3, libTab == TAB_FAV ? "No favorites yet: press left X on a game to star it."
+                                             : "Nothing played yet. Pick something from All games.", C_TEXT);
+        } else {
+            const int cols = 4, cardW = 248, cardH = 336, top = 40;
+            int row0 = std::max(0, romSel / cols - 1);
+            row0 = std::min(row0, std::max(0, ((int)libView.size() - 1) / cols - 1));
+            for (int i = 0; i < 2 * cols; i++) {
+                int idx = row0 * cols + i;
+                if (idx >= (int)libView.size()) break;
+                int x0 = 16 + (i % cols) * cardW, y0 = top + (i / cols) * cardH;
+                const std::string &rom = libView[idx];
+                bool sel = idx == romSel;
+                if (sel)
+                    for (int y = y0; y < y0 + cardH - 8; y++)
+                        for (int x = x0; x < x0 + cardW - 8; x++) menuPixels[y * MENU_W + x] = (y < y0 + 4 || y >= y0 + cardH - 12 || x < x0 + 4 || x >= x0 + cardW - 12) ? C_HI : C_SELBG;
+                const std::vector<uint32_t> *cv = cover(rom);
+                int cx = x0 + 8, cy = y0 + 8;
+                for (int y = 0; y < CARD_H; y++)
+                    for (int x = 0; x < CARD_W; x++)
+                        menuPixels[(cy + y) * MENU_W + cx + x] = cv ? (*cv)[y * CARD_W + x] : 0xff3a2a20;
+                std::string name = rom.substr(0, rom.find_last_of('.'));
+                if (!cv) drawSmall(cx + 8, cy + CARD_H / 2 - 8, name.substr(0, 26), C_DIM);
+                // title on up to two lines, then playtime and last played
+                std::string l1 = name, l2;
+                if (name.size() > 28) {  // wrap at the last space that fits
+                    size_t cut = name.rfind(' ', 28);
+                    if (cut == std::string::npos || cut < 12) cut = 28;
+                    l1 = name.substr(0, cut);
+                    l2 = name.substr(cut + (name[cut] == ' ' ? 1 : 0));
+                    if (l2.size() > 28) l2 = l2.substr(0, 26) + "..";
+                }
+                drawSmall(cx, cy + CARD_H + 8, l1, sel ? 0xffffffff : C_TEXT);
+                if (!l2.empty()) drawSmall(cx, cy + CARD_H + 26, l2, sel ? 0xffffffff : C_TEXT);
+                auto it = stats.find(rom);
+                std::string meta = it != stats.end() ? playtimeText(it->second.seconds) : "new";
+                std::string lp = it != stats.end() ? lastPlayedText(it->second.lastPlayed) : "";
+                if (!lp.empty()) meta += "  -  " + lp;
+                drawSmall(cx, cy + CARD_H + 50, meta, C_DIM);
+                if (it != stats.end() && it->second.fav) drawSmall(cx + CARD_W - 16, cy + CARD_H + 50, "*", 0xff30d0ff);
+            }
+        }
+        snprintf(buf, sizeof buf, "%d/%d  A: play  X: favorite  grips: tabs  B: back", libView.empty() ? 0 : romSel + 1, (int)libView.size());
+        drawText(1, ROWS - 1, buf, C_DIM);
     } else if (menuMode == MENU_PAUSE) {
         std::string n = stem();
         if ((int)n.size() > COLS - 2) n = n.substr(0, COLS - 2);
@@ -1035,18 +1183,26 @@ static void menuInput(const bool *b) {
         return;
     }
     if (menuMode == MENU_ROMS) {
-        if (roms.empty()) { if (ok) scanRoms(); menuDirty |= ok; return; }
-        int page = ROWS - 3;
-        if (up) romSel = (romSel + (int)roms.size() - 1) % (int)roms.size();
-        if (down) romSel = (romSel + 1) % (int)roms.size();
-        if (left) romSel = std::max(0, romSel - page);
-        if (right) romSel = std::min((int)roms.size() - 1, romSel + page);
-        if (ok) {
-            if (loadGame(roms[romSel])) { menuMode = MENU_HELP; resetMenuInput(); }
-            else showToast("Could not load that ROM");
+        if (roms.empty()) { if (ok) { scanRoms(); buildLibView(); } menuDirty |= ok; return; }
+        bool tabL = b[B_L] && !gripHeldL, tabR = b[B_R] && !gripHeldR, fav = b[B_SELECT] && !favHeld;
+        gripHeldL = b[B_L]; gripHeldR = b[B_R]; favHeld = b[B_SELECT];
+        if (tabL || tabR) { libTab = (libTab + (tabR ? 1 : TAB_N - 1)) % TAB_N; romSel = 0; buildLibView(); }
+        int n = (int)libView.size();
+        if (n) {
+            if (up) romSel = std::max(0, romSel - 4);
+            if (down) romSel = std::min(n - 1, romSel + 4);
+            if (left) romSel = std::max(0, romSel - 1);
+            if (right) romSel = std::min(n - 1, romSel + 1);
+            if (fav) { auto &g = stats[libView[romSel]]; g.fav = !g.fav; saveStats(); if (libTab == TAB_FAV) buildLibView(); }
+            if (ok) {
+                std::string pick = libView[romSel];
+                bool firstTime = stats[pick].seconds < 1;
+                if (loadGame(pick)) { menuMode = firstTime ? MENU_HELP : MENU_NONE; resetMenuInput(); }
+                else showToast("Could not load that ROM");
+            }
         }
         if (back && gameLoaded) menuMode = MENU_PAUSE;
-        menuDirty |= up || down || left || right || ok || back;
+        menuDirty |= up || down || left || right || ok || back || tabL || tabR || fav;
         return;
     }
     // pause menu
@@ -1093,7 +1249,7 @@ static void menuInput(const bool *b) {
         case P_RESET: defaultPlacement(); saveGlobal(); showToast("Position reset"); break;
         case P_SAVE: menuMode = MENU_SLOTS; slotSaving = true; break;
         case P_LOAD: menuMode = MENU_SLOTS; slotSaving = false; break;
-        case P_GAMES: scanRoms(); menuMode = MENU_ROMS; break;
+        case P_GAMES: scanRoms(); saveStats(); buildLibView(); menuMode = MENU_ROMS; break;
         case P_ABOUT: menuMode = MENU_ABOUT; aboutTop = 0; break;
         }
     }
@@ -1208,7 +1364,12 @@ void android_main(android_app *app) {
         }
         trace("about page: %d lines", (int)aboutLines.size());
     }
+    coverDir = filesDir + "/covers";
+    mkdir(coverDir.c_str(), 0775);
+    loadStats();
     scanRoms();
+    for (auto &[n, g] : stats) if (g.lastPlayed) libTab = TAB_RECENT;
+    buildLibView();
 
     if (!initXR(app)) { LOGE("OpenXR init failed"); ANativeActivity_finish(app->activity); }
     startAudio();
@@ -1275,6 +1436,20 @@ void android_main(android_app *app) {
                 static double frameMs = 0; static int frameN = 0;
                 if (hr) { frameMs += (nowSec() - t0) * 1000.0 / hr; frameN++; }
                 if (frameN == 600) { trace("headless: %.2f ms per frame incl. rewind snapshots, history %zu steps / %zu KB", frameMs / frameN, rewinder.depth(), rewinder.bytes() / 1024); frameMs = 0; frameN = 0; }
+                if (access((filesDir + "/menu_request").c_str(), F_OK) == 0) {  // debug: save the library panel as menu.png
+                    std::vector<uint8_t> req;
+                    readFile(filesDir + "/menu_request", req);
+                    remove((filesDir + "/menu_request").c_str());
+                    MenuMode keep = menuMode;
+                    if (!req.empty() && req[0] >= '0' && req[0] <= '2') libTab = req[0] - '0';
+                    if (req.size() > 2) romSel = atoi((const char *)req.data() + 2);
+                    menuMode = MENU_ROMS; buildLibView(); renderMenu();
+                    std::vector<uint8_t> rgb(MENU_W * MENU_H * 3);
+                    for (int i = 0; i < MENU_W * MENU_H; i++) { uint32_t c = menuPixels[i]; rgb[i * 3] = c & 255; rgb[i * 3 + 1] = (c >> 8) & 255; rgb[i * 3 + 2] = (c >> 16) & 255; }
+                    png::writeRGB(filesDir + "/menu.png", MENU_W, MENU_H, rgb.data());
+                    menuMode = keep;
+                    trace("menu dumped");
+                }
                 if (access((filesDir + "/rewind_request").c_str(), F_OK) == 0) {  // debug: step back 300 snapshots (15 s)
                     remove((filesDir + "/rewind_request").c_str());
                     int n = 0; double r0 = nowSec();
@@ -1350,6 +1525,22 @@ void android_main(android_app *app) {
             } else if (aaStream) { while (ringFill() < target && runs < 4) { runFrame(); runs++; } lastEmu = nowSec(); }
             else { double t = nowSec(); while (t - lastEmu >= 1.0 / (avFps * speed) && runs < 4) { runFrame(); runs++; lastEmu += 1.0 / (avFps * speed); } }
             statRuns += runs;
+            {   // playtime, and a cover captured from play for games that have none
+                static double lastT = nowSec();
+                double t = nowSec(), dt = std::min(t - lastT, 0.1);
+                lastT = t;
+                if (runs) {
+                    stats[gameName].seconds += dt;
+                    playedThisLoad += dt;
+                    if (playedThisLoad > 30 && playedThisLoad - dt <= 30 && frame.valid) {
+                        std::string out = coverDir + "/" + stem() + ".png";
+                        struct stat sb;
+                        bool any = false;
+                        for (const char *e : {".png", ".jpg", ".jpeg", ".webp"}) any |= stat((coverDir + "/" + stem() + e).c_str(), &sb) == 0;
+                        if (!any && png::write565(out, (int)frame.w, (int)frame.h, frame.rgb565.data())) { coverCache.erase(stem()); trace("captured cover for %s", stem().c_str()); }
+                    }
+                }
+            }
             periodicResumeSave();
         }
 
