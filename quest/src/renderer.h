@@ -103,6 +103,8 @@ struct Renderer {
     std::vector<FlatShape> shapes;  // drawn after the sheets each frame
     std::vector<float> opening;     // window style: the frame opening (triangles); sheets show only through it
     std::vector<FlatShape> inside;  // window style: the box walls behind the opening, clipped like the sheets
+    bool captureEye = false;        // debug: read back the next left-eye image
+    std::vector<uint8_t> eyePixels; int eyeW = 0, eyeH = 0;
     int indexCount = 0;
     float frameW = 256, frameH = 224;
     Eye eyes[2];
@@ -325,6 +327,11 @@ struct Renderer {
                 glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(sh.tris.size() / 3));
             }
             glBindVertexArray(0);
+        }
+        if (captureEye && eye == 0) {
+            eyePixels.resize((size_t)e.w * e.h * 4); eyeW = e.w; eyeH = e.h;
+            glReadPixels(0, 0, e.w, e.h, GL_RGBA, GL_UNSIGNED_BYTE, eyePixels.data());
+            captureEye = false;
         }
         const GLenum discardDepth = GL_DEPTH_STENCIL_ATTACHMENT;
         glInvalidateFramebuffer(GL_FRAMEBUFFER, 1, &discardDepth);

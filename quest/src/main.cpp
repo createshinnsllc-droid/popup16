@@ -274,7 +274,19 @@ void android_main(android_app *app) {
                 headYaw = atan2f(-f.x, -f.z);
             }
             static bool placedOnce = false;
-            if (!placedOnce || recenterPending) { placeMenu(); placedOnce = true; recenterPending = false; }
+            if (!placedOnce) { placeMenu(); placedOnce = true; }
+            if (recenterPending && nowSec() >= recenterAt && (hl.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)) {
+                // Recentering (hold the Meta button) means "bring it back to me": the game returns in
+                // front of you in its current style and size, the tabletop re-seats itself, the menu follows.
+                recenterPending = false;
+                placeMenu();
+                if (on(cfg.table)) { float w = cfg.screenWidth; setTabletop(true); cfg.screenWidth = w; }  // keep your size
+                else defaultPlacement();
+                if (on(cfg.seatMarked)) markSeatHere();
+                saveGlobal();
+                showToast("Game brought back in front of you");
+                trace("recenter: game placed at %.2f %.2f %.2f", cfg.px, cfg.py, cfg.pz);
+            }
         }
         renderer.shapes.clear();
         pointerUpdate(fs.predictedDisplayTime);
@@ -296,6 +308,20 @@ void android_main(android_app *app) {
                 nextCheck = nowSec() + 0.5;
                 if (access((filesDir + "/shot_request").c_str(), F_OK) == 0) { remove((filesDir + "/shot_request").c_str()); takeScreenshot(); }
                 if (access((filesDir + "/clip_request").c_str(), F_OK) == 0) { remove((filesDir + "/clip_request").c_str()); saveClip(); }
+                if (access((filesDir + "/eye_request").c_str(), F_OK) == 0) { remove((filesDir + "/eye_request").c_str()); renderer.captureEye = true; }
+            }
+            if (!renderer.eyePixels.empty()) {  // left eye as the headset saw it, upside down from GL
+                std::vector<uint8_t> rgb((size_t)renderer.eyeW * renderer.eyeH * 3);
+                for (int y = 0; y < renderer.eyeH; y++)
+                    for (int x = 0; x < renderer.eyeW; x++) {
+                        const uint8_t *p = &renderer.eyePixels[((size_t)(renderer.eyeH - 1 - y) * renderer.eyeW + x) * 4];
+                        uint8_t *q = &rgb[((size_t)y * renderer.eyeW + x) * 3];
+                        q[0] = p[0]; q[1] = p[1]; q[2] = p[2];
+                    }
+                png::writeRGB(filesDir + "/eye.png", renderer.eyeW, renderer.eyeH, rgb.data());
+                trace("eye captured %dx%d; head %.2f %.2f %.2f yaw %.2f; game %.2f %.2f %.2f w %.2f box %.0f", renderer.eyeW, renderer.eyeH,
+                      headX, headY, headZ, headYaw, cfg.px, cfg.py, cfg.pz, cfg.screenWidth, cfg.box);
+                renderer.eyePixels.clear();
             }
         }
         bool menuBtn = xrMenu || padMenu || (physDown[PH_PAD_SELECT] && physDown[PH_PAD_START]);
@@ -400,6 +426,14 @@ void android_main(android_app *app) {
         {   // upload the newest finished build
             int r;
             { std::lock_guard<std::mutex> l(worker.m); r = worker.ready; worker.ready = -1; worker.uploading = r; }
+            static int dropped = 0, uploaded = 0;
+            if (r >= 0 && worker.builtGen[r] != gameGen) dropped++;
+            static double nextReport = 0;
+            if (kDevHooks && nowSec() > nextReport) {
+                nextReport = nowSec() + 5;
+                trace("sheets: %d uploaded, %d dropped (gen %u), quads %d, frame %d, loaded %d", uploaded, dropped, gameGen,
+                      renderer.indexCount / 6, (int)frame.valid, (int)gameLoaded);
+            }
             if (r >= 0 && worker.builtGen[r] != gameGen) {  // built from the previous game: drop it
                 std::lock_guard<std::mutex> l(worker.m);
                 worker.uploading = -1;
@@ -409,6 +443,7 @@ void android_main(android_app *app) {
                 diorama::Builder &b = worker.builders[r];
                 renderer.haze = b.look.on ? b.look.haze : 0.0f;
                 renderer.upload(b, b.lastW, b.lastH);
+                uploaded++;
                 std::lock_guard<std::mutex> l(worker.m);
                 worker.uploading = -1;
             }
