@@ -22,6 +22,7 @@ static bool hasRoomView() { return hasPassthrough; }
 static XrPassthroughFB passthrough = XR_NULL_HANDLE;
 static XrPassthroughLayerFB passthroughLayer = XR_NULL_HANDLE;
 static bool passthroughRunning = false;
+static void resetPassthrough();
 static Swap menuSwap;
 static XrActionSet actionSet;
 static XrAction actA, actB, actX, actY, actTrigL, actTrigR, actGripL, actGripR, actMenu, actStickL, actStickR, actClickL, actClickR;
@@ -214,6 +215,7 @@ static bool initXR(android_app *app) {
         if (!strcmp(p.extensionName, XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME)) hasRefreshExt = true;
         if (!strcmp(p.extensionName, XR_FB_PASSTHROUGH_EXTENSION_NAME)) hasPassthrough = true;
     }
+    resetPassthrough();
     std::vector<const char *> exts = {XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME, XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME};
     if (hasRefreshExt) exts.push_back(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
     if (hasPassthrough) exts.push_back(XR_FB_PASSTHROUGH_EXTENSION_NAME);
@@ -279,14 +281,31 @@ static bool initXR(android_app *app) {
 // room passthrough (XR_FB_passthrough): created once, started only while "your room" is chosen
 // Returns true only when the room is actually running. A start failure leaves it off (and is
 // reported once, not once per frame) so the caller can fall back to an opaque scene.
+// Room-view objects and entry points belong to one OpenXR instance and session. Quest can start the
+// app's main loop again inside the same process (leaving to Home and coming back), so they are reset
+// whenever a new instance is created and destroyed with the session; stale handles otherwise fail
+// with XR_ERROR_HANDLE_INVALID and the room never comes back.
+static PFN_xrCreatePassthroughFB createPt;
+static PFN_xrCreatePassthroughLayerFB createLayer;
+static PFN_xrPassthroughStartFB startPt;
+static PFN_xrPassthroughPauseFB pausePt;
+static PFN_xrPassthroughLayerResumeFB resumeLayer;
+static PFN_xrPassthroughLayerPauseFB pauseLayer;
+static PFN_xrDestroyPassthroughFB destroyPt;
+static PFN_xrDestroyPassthroughLayerFB destroyLayer;
+static void resetPassthrough() {  // forget everything from a previous instance (do not call into it)
+    createPt = nullptr; createLayer = nullptr; startPt = nullptr; pausePt = nullptr;
+    resumeLayer = nullptr; pauseLayer = nullptr; destroyPt = nullptr; destroyLayer = nullptr;
+    passthrough = XR_NULL_HANDLE; passthroughLayer = XR_NULL_HANDLE; passthroughRunning = false;
+}
+static void destroyPassthrough() {  // with the session still alive, before it is destroyed
+    if (passthroughLayer && destroyLayer) destroyLayer(passthroughLayer);
+    if (passthrough && destroyPt) destroyPt(passthrough);
+    passthroughLayer = XR_NULL_HANDLE; passthrough = XR_NULL_HANDLE; passthroughRunning = false;
+}
+
 static bool setPassthrough(bool want) {
     if (!hasPassthrough) { passthroughRunning = false; return false; }
-    static PFN_xrCreatePassthroughFB createPt;
-    static PFN_xrCreatePassthroughLayerFB createLayer;
-    static PFN_xrPassthroughStartFB startPt;
-    static PFN_xrPassthroughPauseFB pausePt;
-    static PFN_xrPassthroughLayerResumeFB resumeLayer;
-    static PFN_xrPassthroughLayerPauseFB pauseLayer;
     static XrResult lastFail = XR_SUCCESS;
     if (!createPt) {
         xrGetInstanceProcAddr(instance, "xrCreatePassthroughFB", (PFN_xrVoidFunction *)&createPt);
@@ -295,6 +314,8 @@ static bool setPassthrough(bool want) {
         xrGetInstanceProcAddr(instance, "xrPassthroughPauseFB", (PFN_xrVoidFunction *)&pausePt);
         xrGetInstanceProcAddr(instance, "xrPassthroughLayerResumeFB", (PFN_xrVoidFunction *)&resumeLayer);
         xrGetInstanceProcAddr(instance, "xrPassthroughLayerPauseFB", (PFN_xrVoidFunction *)&pauseLayer);
+        xrGetInstanceProcAddr(instance, "xrDestroyPassthroughFB", (PFN_xrVoidFunction *)&destroyPt);
+        xrGetInstanceProcAddr(instance, "xrDestroyPassthroughLayerFB", (PFN_xrVoidFunction *)&destroyLayer);
         if (!createPt || !createLayer || !startPt || !pausePt || !resumeLayer || !pauseLayer) { hasPassthrough = false; passthroughRunning = false; return false; }
     }
     if (want == passthroughRunning) return passthroughRunning;
@@ -315,6 +336,9 @@ static bool setPassthrough(bool want) {
         if (XR_SUCCEEDED(sr)) sr = resumeLayer(passthroughLayer);
         if (XR_FAILED(sr)) {  // your room is not available in this state: stay opaque and look again soon
             if (sr != lastFail) trace("passthrough start failed (%d)", (int)sr);
+            if (sr == XR_ERROR_HANDLE_INVALID) {  // objects from an earlier session: build fresh ones next try
+                passthroughLayer = XR_NULL_HANDLE; passthrough = XR_NULL_HANDLE;
+            }
             lastFail = sr;
             nextTry = nowSec() + 1.0;
             passthroughRunning = false;

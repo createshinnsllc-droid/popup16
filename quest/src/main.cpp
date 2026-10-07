@@ -516,7 +516,7 @@ void android_main(android_app *app) {
     unloadGame();
     saveGlobal();
     stopAudio();
-    if (session) xrDestroySession(session);
+    if (session) { destroyPassthrough(); xrDestroySession(session); }
     if (instance) xrDestroyInstance(instance);
     app->activity->vm->DetachCurrentThread();
 }
