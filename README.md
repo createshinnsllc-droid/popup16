@@ -65,9 +65,10 @@ projection layer.
 
 ## License
 
-PopUp16's own code is MIT licensed (see `LICENSE`). Snes9x and the other components keep
-their own licenses, listed in full in `THIRD_PARTY_NOTICES.txt`; the Snes9x license
-allows non-commercial use only. Super NES and Super Nintendo Entertainment System are
+PopUp16's own code is MIT licensed (see `LICENSE`). That license covers only PopUp16's
+code: Snes9x and the other components keep their own licenses, listed in full in
+`THIRD_PARTY_NOTICES.txt`. The Snes9x license allows non-commercial use only, so builds
+that include the Snes9x core may not be sold. Super NES and Super Nintendo Entertainment System are
 trademarks of Nintendo; this project is not affiliated with or endorsed by Nintendo.
 
 Made by TyDroElite / CreateShinns LLC.

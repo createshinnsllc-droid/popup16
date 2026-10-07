@@ -20,9 +20,3 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
--------------------------------------------------------------------------------
-Scope: this MIT license covers PopUp16's own source code in this repository.
-It does not cover Snes9x or the other third-party components PopUp16 builds on;
-they keep their own licenses (see THIRD_PARTY_NOTICES.txt). In particular, the
-Snes9x license allows non-commercial use only, so builds that include the
-Snes9x core may not be sold.
