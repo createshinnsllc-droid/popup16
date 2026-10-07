@@ -1,7 +1,7 @@
-SNES3D - third-party notices
+PopUp16 - third-party notices
 ============================
 
-SNES3D is a stereoscopic / layered-3D frontend built on the Snes9x emulator core.
+PopUp16 is a stereoscopic / layered-3D frontend built on the Snes9x emulator core.
 It is free, non-commercial software. No games are included; use only game files
 you are legally entitled to use.
 

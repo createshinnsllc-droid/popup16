@@ -71,7 +71,7 @@ assert len(code) < DATA_BASE
 ROM[0:len(code)] = code
 ROM[DATA_BASE:DATA_BASE + len(blobs)] = blobs
 h = 0x7FC0
-ROM[h:h+21] = b'SNES3D LAYER TEST    '
+ROM[h:h+21] = b'POPUP16 LAYER TEST   '
 ROM[h+0x15] = 0x20; ROM[h+0x16] = 0; ROM[h+0x17] = 0x07; ROM[h+0x18] = 0; ROM[h+0x19] = 1; ROM[h+0x1A] = 0; ROM[h+0x1B] = 0
 for v in range(0x7FE4, 0x8000, 2): ROM[v:v+2] = struct.pack('<H', rti)
 ROM[0x7FFC:0x7FFE] = struct.pack('<H', 0x8000)

@@ -1,7 +1,7 @@
 # separate checkout of snes9x with our patch applied (see setup.sh / snes9x-stereo3d.patch)
 snes9x/
 # build outputs
-frontend/snes3d
+frontend/popup16
 quest/build/
 quest/third_party/oxr/
 # generated test ROM (rebuild with test/make_test_rom.py)

@@ -1,4 +1,4 @@
-// SNES3D for Meta Quest: standalone OpenXR app running the patched snes9x core.
+// PopUp16 for Meta Quest: standalone OpenXR app running the patched snes9x core.
 // Each frame is warped once per eye (shared/stereo.h) and shown on a virtual screen built from two
 // quad layers, one visible only to the left eye and one only to the right, so SNES layers sit at
 // different depths. Touch controllers or a Bluetooth gamepad drive the game; Left Y opens the menu.
@@ -38,8 +38,8 @@
 #include "font8x16.h"
 #include "renderer.h"
 
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "SNES3D", __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "SNES3D", __VA_ARGS__)
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "PopUp16", __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "PopUp16", __VA_ARGS__)
 #define XRCHECK(x) do { XrResult r_ = (x); if (XR_FAILED(r_)) { LOGE("%s failed: %d (line %d)", #x, (int)r_, __LINE__); } } while (0)
 
 extern "C" const uint8_t *snes3d_get_layers(void);
@@ -53,7 +53,7 @@ static FILE *traceFile = nullptr;
 static void trace(const char *fmt, ...) {
     char buf[256];
     va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
-    __android_log_print(ANDROID_LOG_INFO, "SNES3D", "%s", buf);
+    __android_log_print(ANDROID_LOG_INFO, "PopUp16", "%s", buf);
     if (traceFile) {
         time_t t = time(nullptr); char ts[32]; strftime(ts, sizeof ts, "%H:%M:%S", localtime(&t));
         fprintf(traceFile, "%s %s\n", ts, buf); fflush(traceFile);
@@ -374,7 +374,7 @@ static const char *helpLines[] = {
     "SNES L / R ...... left grip / right grip",
     "Start ........... left menu button or right stick click",
     "Select .......... left X or left stick click",
-    "SNES3D menu ..... left Y",
+    "PopUp16 menu ..... left Y",
     "",
     "Bluetooth gamepads work too (menu: Select+Start).",
     "",
@@ -387,7 +387,7 @@ static void renderMenu() {
     std::fill(menuPixels.begin(), menuPixels.end(), C_BG);
     char buf[160];
     if (menuMode == MENU_ROMS) {
-        drawText(1, 0, "SNES3D - choose a game", C_HI);
+        drawText(1, 0, "PopUp16 - choose a game", C_HI);
         if (roms.empty()) {
             drawText(1, 2, "No ROMs found. Copy .sfc files to:", C_TEXT);
             drawText(1, 3, romDir.substr(0, COLS - 2), C_DIM);
@@ -635,7 +635,7 @@ static bool initXR(android_app *app) {
     ia.applicationVM = app->activity->vm; ia.applicationActivity = app->activity->clazz;
     XrInstanceCreateInfo ci{XR_TYPE_INSTANCE_CREATE_INFO};
     ci.next = &ia;
-    strcpy(ci.applicationInfo.applicationName, "SNES3D");
+    strcpy(ci.applicationInfo.applicationName, "PopUp16");
     ci.applicationInfo.applicationVersion = 1;
     ci.applicationInfo.apiVersion = XR_API_VERSION_1_0;
     ci.enabledExtensionCount = (uint32_t)exts.size(); ci.enabledExtensionNames = exts.data();
@@ -853,7 +853,7 @@ void android_main(android_app *app) {
     traceFile = fopen((filesDir + "/input.log").c_str(), "a");
     trace("---- start, ROM folder %s", romDir.c_str());
     {
-        aboutLines = {"SNES3D 0.1 (working title) - layered 3D for SNES games on Quest",
+        aboutLines = {"PopUp16 0.1 - layered 3D for 16-bit console games on Quest",
                       "Made by TyDroElite / CreateShinns LLC. Free, non-commercial software.",
                       "Emulation by the Snes9x team. No games included.", "", ""};
         if (AAsset *as = AAssetManager_open(app->activity->assetManager, "NOTICES.txt", AASSET_MODE_BUFFER)) {
@@ -952,7 +952,7 @@ void android_main(android_app *app) {
             static bool lastMenu;
             for (int i = 0; i < B_COUNT; i++)
                 if (all[i] != last[i]) { trace("input SNES %s %s (menu mode %d, game %d)", names[i], all[i] ? "down" : "up", (int)menuMode, (int)gameLoaded); last[i] = all[i]; }
-            if (xrMenu != lastMenu) { trace("input SNES3D-menu button %s", xrMenu ? "down" : "up"); lastMenu = xrMenu; }
+            if (xrMenu != lastMenu) { trace("input PopUp16-menu button %s", xrMenu ? "down" : "up"); lastMenu = xrMenu; }
         }
         bool menuBtn = xrMenu || padMenu || (padButtons[B_SELECT] && padButtons[B_START]);
         if (menuBtn && !prevMenuBtn) {

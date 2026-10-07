@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Assembles THIRD_PARTY_NOTICES.txt from the actual license files of every component that is
-compiled into SNES3D, and copies it into the Quest APK assets (shown by the in-app About page).
+compiled into PopUp16, and copies it into the Quest APK assets (shown by the in-app About page).
 Run from the repo root after ./setup.sh: python3 tools/make_notices.py"""
 import os
 import subprocess
@@ -32,10 +32,10 @@ def section(title, body):
 
 
 intro = textwrap.dedent("""\
-    SNES3D - third-party notices
+    PopUp16 - third-party notices
     ============================
 
-    SNES3D is a stereoscopic / layered-3D frontend built on the Snes9x emulator core.
+    PopUp16 is a stereoscopic / layered-3D frontend built on the Snes9x emulator core.
     It is free, non-commercial software. No games are included; use only game files
     you are legally entitled to use.
 

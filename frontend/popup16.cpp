@@ -1,4 +1,4 @@
-// SNES3D: stereoscopic side-by-side SNES frontend for a patched snes9x libretro core.
+// PopUp16: stereoscopic side-by-side SNES frontend for a patched snes9x libretro core.
 // The core exports a per-pixel layer id (BG1-4, sprites, backdrop, Mode 7) and priority depth.
 // Each layer gets a disparity; every frame is forward-warped once per eye and shown side by side,
 // ready for Virtual Desktop's SBS 3D mode on a Quest headset.
@@ -245,7 +245,7 @@ static int scoreDump(const std::string &n) {
 
 static void updateTitle(SDL_Window *w, const std::string &name, const char *msg = nullptr) {
     char t[512];
-    snprintf(t, sizeof t, "SNES3D - %s | 3D %s  depth %.2f  conv %+.1f  %s%s%s",
+    snprintf(t, sizeof t, "PopUp16 - %s | 3D %s  depth %.2f  conv %+.1f  %s%s%s",
              name.c_str(), stereoOn ? "on" : "off", prof.strength, prof.convergence,
              prof.halfSbs ? "half-SBS" : "full-SBS", msg ? "  | " : "", msg ? msg : "");
     SDL_SetWindowTitle(w, t);
@@ -253,7 +253,7 @@ static void updateTitle(SDL_Window *w, const std::string &name, const char *msg 
 
 int main(int argc, char **argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: snes3d <snes9x_libretro.dylib> <rom.sfc|.smc|.zip> [--window]\n");
+        fprintf(stderr, "usage: popup16 <snes9x_libretro.dylib> <rom.sfc|.smc|.zip> [--window]\n");
         return 1;
     }
     std::string corePath = argv[1], romPath = argv[2];
@@ -262,7 +262,7 @@ int main(int argc, char **argv) {
     bool dump = argc > 5 && std::string(argv[3]) == "--dump";
 
     const char *home = getenv("HOME");
-    std::string base = std::string(home ? home : ".") + "/Library/Application Support/SNES3D";
+    std::string base = std::string(home ? home : ".") + "/Library/Application Support/PopUp16";
     mkdir(base.c_str(), 0755);
     sysDir = base + "/system"; saveDir = base + "/saves";
     std::string profDir = base + "/profiles";
@@ -346,9 +346,9 @@ int main(int argc, char **argv) {
 
     if (dump) {
         int n = atoi(argv[4]);
-        bool scripted = getenv("SNES3D_AUTO") != nullptr;
-        // SNES3D_PLANES=<prefix>: also write each solo layer (BG1-4, OBJ) as <prefix>N.bmp, empty = magenta
-        const char *planePrefix = getenv("SNES3D_PLANES");
+        bool scripted = getenv("POPUP16_AUTO") != nullptr;
+        // POPUP16_PLANES=<prefix>: also write each solo layer (BG1-4, OBJ) as <prefix>N.bmp, empty = magenta
+        const char *planePrefix = getenv("POPUP16_PLANES");
         auto enablePlanes = (void (*)(int))dlsym(core.h, "snes3d_enable_planes");
         if (planePrefix && enablePlanes) enablePlanes(1);
         for (int i = 0; i < n; i++) { if (scripted) autoFrame = i; core.run(); }
@@ -411,10 +411,10 @@ int main(int argc, char **argv) {
             for (size_t i = 0; i < out.size(); i++) bad += out[i] != (db.lut[cur.rgb565[i]] & 0xffffff);
             int sheets = 0; { std::vector<int> seen; for (auto &q : db.quads) { int k = (int)q.slice * 256 + (int)q.z; if (std::find(seen.begin(), seen.end(), k) == seen.end()) seen.push_back(k); } sheets = (int)seen.size(); }
             printf("diorama: %zu quads, %d sheets, head-on mismatch %d of %zu px\n", db.quads.size(), sheets, bad, out.size());
-            if (getenv("SNES3D_SHEETS"))
+            if (getenv("POPUP16_SHEETS"))
                 for (auto &q : db.quads) if (q.v == (float)(h / 2)) printf("  row %d slice %d z %d disparity %+.2f span %d-%d\n", (int)q.v, (int)q.slice, (int)q.z, q.disparity, (int)q.u0, (int)q.u1);
         }
-        if (getenv("SNES3D_DEBUG")) {
+        if (getenv("POPUP16_DEBUG")) {
             std::vector<int> pairs(8 * 256, 0);
             for (size_t i = 0; i < cur.layers.size(); i++) pairs[(cur.layers[i] & 7) * 256 + cur.depths[i]]++;
             static const char *nm[8] = {"BG1", "BG2", "BG3", "BG4", "OBJ", "backdrop", "M7", "M7ext"};
@@ -436,7 +436,7 @@ int main(int argc, char **argv) {
     }
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
     Uint32 wflags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | (startWindowed ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
-    SDL_Window *win = SDL_CreateWindow("SNES3D", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1600, 900, wflags);
+    SDL_Window *win = SDL_CreateWindow("PopUp16", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1600, 900, wflags);
     SDL_Renderer *ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!win || !ren) { fprintf(stderr, "SDL window: %s\n", SDL_GetError()); return 1; }
     SDL_RaiseWindow(win);
@@ -455,7 +455,7 @@ int main(int argc, char **argv) {
     SDL_Texture *tex = nullptr;
     unsigned texH = 0;
     updateTitle(win, stem);
-    printf("SNES3D running %s\n"
+    printf("PopUp16 running %s\n"
            "  pad/keys: arrows, Z=B X=A A=Y S=X Q=L W=R Enter=Start RShift=Select\n"
            "  1/2 depth -/+   3/4 convergence -/+   0 3D on/off   B half/full SBS   P swap eyes\n"
            "  M Mode 7 ramp   [ ] aspect   F fullscreen   F5 save state   F7 load state   Tab fast-forward   Esc quit\n",
@@ -519,7 +519,7 @@ int main(int argc, char **argv) {
         }
         static Uint64 statT = SDL_GetTicks64(); static int statRuns = 0, statPresents = 0;
         statRuns += runs; statPresents++;
-        if (getenv("SNES3D_DEBUG") && SDL_GetTicks64() - statT >= 2000) {
+        if (getenv("POPUP16_DEBUG") && SDL_GetTicks64() - statT >= 2000) {
             fprintf(stderr, "emu %.1f fps, present %.1f fps, audio queue %u B\n", statRuns / 2.0, statPresents / 2.0,
                     audioDev ? SDL_GetQueuedAudioSize(audioDev) : 0);
             statT = SDL_GetTicks64(); statRuns = statPresents = 0;
