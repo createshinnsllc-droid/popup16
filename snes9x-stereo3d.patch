@@ -1,0 +1,206 @@
+From e81b910ff5ef587b72a262d2c35be16781f8b9f0 Mon Sep 17 00:00:00 2001
+From: CreateShinns <261191256+createshinnsllc-droid@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 07:18:55 -0400
+Subject: [PATCH] Export per-pixel layer id and priority depth for stereo 3D
+
+Adds GFX.LayerBuf (layer id per main-screen pixel: 0-3 BG1-4, 4 OBJ,
+5 backdrop, 6/7 Mode 7) written alongside the existing Z-buffer, and
+extern "C" snes3d_get_layers / snes3d_get_depths in the libretro core.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gfx.cpp               | 13 +++++++++++++
+ gfx.h                 |  4 ++++
+ libretro/libretro.cpp | 14 +++++++++++---
+ tileimpl-h2x1.cpp     |  1 +
+ tileimpl-n1x1.cpp     |  1 +
+ tileimpl-n2x1.cpp     |  1 +
+ 6 files changed, 31 insertions(+), 3 deletions(-)
+
+diff --git a/gfx.cpp b/gfx.cpp
+index 375414a..feccb6b 100644
+--- a/gfx.cpp
++++ b/gfx.cpp
+@@ -59,6 +59,9 @@ bool8 S9xGraphicsInit (void)
+ 	GFX.SubScreen  = (uint16 *) malloc(GFX.ScreenSize * sizeof(uint16));
+ 	GFX.ZBuffer    = (uint8 *)  malloc(GFX.ScreenSize);
+ 	GFX.SubZBuffer = (uint8 *)  malloc(GFX.ScreenSize);
++	GFX.LayerBuf   = (uint8 *)  calloc(GFX.ScreenSize, 1);
++	GFX.LayerScratch = (uint8 *) calloc(GFX.ScreenSize, 1);
++	GFX.LB = GFX.LayerScratch;
+ 
+ 	if (!GFX.ZERO || !GFX.SubScreen || !GFX.ZBuffer || !GFX.SubZBuffer)
+ 	{
+@@ -107,6 +110,8 @@ void S9xGraphicsDeinit (void)
+ 	if (GFX.SubScreen)  { free(GFX.SubScreen);  GFX.SubScreen  = NULL; }
+ 	if (GFX.ZBuffer)    { free(GFX.ZBuffer);    GFX.ZBuffer    = NULL; }
+ 	if (GFX.SubZBuffer) { free(GFX.SubZBuffer); GFX.SubZBuffer = NULL; }
++	if (GFX.LayerBuf)   { free(GFX.LayerBuf);   GFX.LayerBuf   = NULL; }
++	if (GFX.LayerScratch) { free(GFX.LayerScratch); GFX.LayerScratch = NULL; }
+ }
+ 
+ void S9xGraphicsScreenResize (void)
+@@ -178,6 +183,7 @@ void S9xStartScreenRefresh (void)
+ 
+ 		memset(GFX.ZBuffer, 0, GFX.ScreenSize);
+ 		memset(GFX.SubZBuffer, 0, GFX.ScreenSize);
++		memset(GFX.LayerBuf, 5, GFX.ScreenSize);
+ 	}
+ 
+ 	if (++IPPU.FrameCount == (uint32)Memory.ROMFramesPerSecond)
+@@ -321,6 +327,7 @@ static inline void RenderScreen (bool8 sub)
+ 		if (GFX.DoInterlace && S9xInterlaceField())
+ 			GFX.S += GFX.RealPPL;
+ 		GFX.DB = GFX.ZBuffer;
++		GFX.LB = GFX.LayerBuf;
+ 		GFX.Clip = IPPU.Clip[0];
+ 		BGActive = Memory.FillRAM[0x212c] & ~Settings.BG_Forced;
+ 		D = 32;
+@@ -329,6 +336,7 @@ static inline void RenderScreen (bool8 sub)
+ 	{
+ 		GFX.S = GFX.SubScreen;
+ 		GFX.DB = GFX.SubZBuffer;
++		GFX.LB = GFX.LayerScratch;
+ 		GFX.Clip = IPPU.Clip[1];
+ 		BGActive = Memory.FillRAM[0x212d] & ~Settings.BG_Forced;
+ 		D = (Memory.FillRAM[0x2130] & 2) << 4; // 'do math' depth flag
+@@ -342,6 +350,7 @@ static inline void RenderScreen (bool8 sub)
+ 		BG.StartPalette = 128;
+ 		S9xSelectTileConverter(4, FALSE, sub, FALSE);
+ 		S9xSelectTileRenderers(PPU.BGMode, sub, TRUE);
++		GFX.CurLayer = 4;
+ 		DrawOBJS(D + 4);
+ 	}
+ 
+@@ -351,6 +360,7 @@ static inline void RenderScreen (bool8 sub)
+ 	#define DO_BG(n, pal, depth, hires, offset, Zh, Zl, voffoff) \
+ 		if (BGActive & (1 << n)) \
+ 		{ \
++			GFX.CurLayer = n; \
+ 			BG.StartPalette = pal; \
+ 			BG.EnableMath = !sub && (Memory.FillRAM[0x2131] & (1 << n)); \
+ 			BG.TileSizeH = (!hires && PPU.BG[n].BGSize) ? 16 : 8; \
+@@ -419,12 +429,14 @@ static inline void RenderScreen (bool8 sub)
+ 			if (BGActive & 0x01)
+ 			{
+ 				BG.EnableMath = !sub && (Memory.FillRAM[0x2131] & 1);
++				GFX.CurLayer = 6;
+ 				DrawBackgroundMode7(0, GFX.DrawMode7BG1Math, GFX.DrawMode7BG1Nomath, D);
+ 			}
+ 
+ 			if ((Memory.FillRAM[0x2133] & 0x40) && (BGActive & 0x02))
+ 			{
+ 				BG.EnableMath = !sub && (Memory.FillRAM[0x2131] & 2);
++				GFX.CurLayer = 7;
+ 				DrawBackgroundMode7(1, GFX.DrawMode7BG2Math, GFX.DrawMode7BG2Nomath, D);
+ 			}
+ 
+@@ -435,6 +447,7 @@ static inline void RenderScreen (bool8 sub)
+ 
+ 	BG.EnableMath = !sub && (Memory.FillRAM[0x2131] & 0x20);
+ 
++	GFX.CurLayer = 5;
+ 	DrawBackdrop();
+ }
+ 
+diff --git a/gfx.h b/gfx.h
+index af9ea81..0b2ba79 100644
+--- a/gfx.h
++++ b/gfx.h
+@@ -20,6 +20,10 @@ struct SGFX
+ 	uint16	*SubScreen;
+ 	uint8	*ZBuffer;
+ 	uint8	*SubZBuffer;
++	uint8	*LayerBuf;		// stereo3d: layer id per main-screen pixel
++	uint8	*LayerScratch;	// stereo3d: sink for sub-screen writes
++	uint8	*LB;
++	uint8	CurLayer;
+ 	uint16	*S;
+ 	uint8	*DB;
+ 	uint16	*ZERO;
+diff --git a/libretro/libretro.cpp b/libretro/libretro.cpp
+index 6060767..9be3fb2 100644
+--- a/libretro/libretro.cpp
++++ b/libretro/libretro.cpp
+@@ -1969,6 +1969,10 @@ bool retro_unserialize(const void* data, size_t size)
+     return true;
+ }
+ 
++static const uint8_t *snes3d_layers = NULL;
++static const uint8_t *snes3d_depths = NULL;
++#define SNES3D_SET_PTRS(off) do { snes3d_layers = GFX.LayerBuf + ((int)(GFX.Pitch >> 1) * (off)); snes3d_depths = GFX.ZBuffer + ((int)(GFX.Pitch >> 1) * (off)); } while (0)
++
+ bool8 S9xDeinitUpdate(int width, int height)
+ {
+     static int burst_phase = 0;
+@@ -2019,7 +2023,7 @@ bool8 S9xDeinitUpdate(int width, int height)
+         else
+             snes_ntsc_blit(snes_ntsc, GFX.Screen, GFX.Pitch / 2, burst_phase, width, height, snes_ntsc_buffer, MAX_SNES_WIDTH_NTSC * 2);
+ 
+-        video_cb(snes_ntsc_buffer + ((int)(MAX_SNES_WIDTH_NTSC) * overscan_offset), SNES_NTSC_OUT_WIDTH(256), height, MAX_SNES_WIDTH_NTSC * 2);
++        SNES3D_SET_PTRS(overscan_offset); video_cb(snes_ntsc_buffer + ((int)(MAX_SNES_WIDTH_NTSC) * overscan_offset), SNES_NTSC_OUT_WIDTH(256), height, MAX_SNES_WIDTH_NTSC * 2);
+     }
+     else if (width == MAX_SNES_WIDTH && hires_blend)
+     {
+@@ -2065,16 +2069,20 @@ bool8 S9xDeinitUpdate(int width, int height)
+             width >>= 1;
+         }
+ 
+-        video_cb(GFX.Screen + ((int)(GFX.Pitch >> 1) * overscan_offset), width, height, GFX.Pitch);
++        SNES3D_SET_PTRS(overscan_offset); video_cb(GFX.Screen + ((int)(GFX.Pitch >> 1) * overscan_offset), width, height, GFX.Pitch);
+     }
+     else
+     {
+-        video_cb(GFX.Screen + ((int)(GFX.Pitch >> 1) * overscan_offset), width, height, GFX.Pitch);
++        SNES3D_SET_PTRS(overscan_offset); video_cb(GFX.Screen + ((int)(GFX.Pitch >> 1) * overscan_offset), width, height, GFX.Pitch);
+     }
+ 
+     return TRUE;
+ }
+ 
++/* stereo3d: per-pixel layer id / priority depth of the last frame, same layout as the video frame (pitch/2 bytes per row) */
++extern "C" RETRO_API const uint8_t *snes3d_get_layers(void) { return snes3d_layers; }
++extern "C" RETRO_API const uint8_t *snes3d_get_depths(void) { return snes3d_depths; }
++
+ bool8 S9xContinueUpdate(int width, int height)
+ {
+     S9xDeinitUpdate(width, height);
+diff --git a/tileimpl-h2x1.cpp b/tileimpl-h2x1.cpp
+index 37143ad..5f43602 100644
+--- a/tileimpl-h2x1.cpp
++++ b/tileimpl-h2x1.cpp
+@@ -20,6 +20,7 @@ namespace TileImpl {
+ 			if ((OffsetInLine + 2 * N) == 0 || (OffsetInLine + 2 * N) == GFX.RealPPL)
+ 				GFX.S[Offset + 2 * N] = MATH::Calc((GFX.ClipColors ? 0 : GFX.SubScreen[Offset + 2 * N]), GFX.RealScreenColors[Pix], GFX.SubZBuffer[Offset + 2 * N]);
+ 			GFX.DB[Offset + 2 * N] = GFX.DB[Offset + 2 * N + 1] = Z2;
++			GFX.LB[Offset + 2 * N] = GFX.LB[Offset + 2 * N + 1] = GFX.CurLayer;
+ 		}
+ 	}
+ 
+diff --git a/tileimpl-n1x1.cpp b/tileimpl-n1x1.cpp
+index 1c37c60..ccd6c79 100644
+--- a/tileimpl-n1x1.cpp
++++ b/tileimpl-n1x1.cpp
+@@ -17,6 +17,7 @@ namespace TileImpl {
+ 		{
+ 			GFX.S[Offset + N] = MATH::Calc(GFX.ScreenColors[Pix], GFX.SubScreen[Offset + N], GFX.SubZBuffer[Offset + N]);
+ 			GFX.DB[Offset + N] = Z2;
++			GFX.LB[Offset + N] = GFX.CurLayer;
+ 		}
+ 	}
+ 
+diff --git a/tileimpl-n2x1.cpp b/tileimpl-n2x1.cpp
+index 4025c69..e5077f6 100644
+--- a/tileimpl-n2x1.cpp
++++ b/tileimpl-n2x1.cpp
+@@ -17,6 +17,7 @@ namespace TileImpl {
+ 		{
+ 			GFX.S[Offset + 2 * N] = GFX.S[Offset + 2 * N + 1] = MATH::Calc(GFX.ScreenColors[Pix], GFX.SubScreen[Offset + 2 * N], GFX.SubZBuffer[Offset + 2 * N]);
+ 			GFX.DB[Offset + 2 * N] = GFX.DB[Offset + 2 * N + 1] = Z2;
++			GFX.LB[Offset + 2 * N] = GFX.LB[Offset + 2 * N + 1] = GFX.CurLayer;
+ 		}
+ 	}
+ 
+-- 
+2.54.0 (Apple Git-157)
+
