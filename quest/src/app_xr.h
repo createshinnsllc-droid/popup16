@@ -22,8 +22,9 @@ static bool hasRoomView() { return hasPassthrough; }
 static XrPassthroughFB passthrough = XR_NULL_HANDLE;
 static XrPassthroughLayerFB passthroughLayer = XR_NULL_HANDLE;
 static bool passthroughRunning = false;
+static bool recenterPending = false;  // re-place the menu once the new head pose is known
 static void resetPassthrough();
-static Swap menuSwap;
+static Swap menuSwap, cursorSwap;
 static XrActionSet actionSet;
 static XrAction actA, actB, actX, actY, actTrigL, actTrigR, actGripL, actGripR, actMenu, actStickL, actStickR, actClickL, actClickR;
 static XrAction actPoseL, actPoseR, actAimL, actAimR;
@@ -256,6 +257,16 @@ static bool initXR(android_app *app) {
     XRCHECK(xrCreateReferenceSpace(session, &rs, &viewSpace));
 
     if (!makeSwap(menuSwap, MENU_W, MENU_H)) return false;
+    if (makeSwap(cursorSwap, 32, 32)) {  // the pointer dot: a white disc with a dark rim
+        std::vector<uint32_t> dot(32 * 32, 0u);
+        for (int y = 0; y < 32; y++)
+            for (int x = 0; x < 32; x++) {
+                float d = sqrtf((x - 15.5f) * (x - 15.5f) + (y - 15.5f) * (y - 15.5f));
+                if (d < 11) dot[y * 32 + x] = 0xffffffffu;
+                else if (d < 15) dot[y * 32 + x] = 0xff302820u;
+            }
+        uploadSwap(cursorSwap, dot.data(), 32, 32);
+    }
     {
         uint32_t vc = 0;
         xrEnumerateViewConfigurationViews(instance, systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &vc, nullptr);
@@ -402,6 +413,11 @@ static void handleXrEvents(android_app *app) {
             } else if (sessionState == XR_SESSION_STATE_EXITING || sessionState == XR_SESSION_STATE_LOSS_PENDING) {
                 ANativeActivity_finish(app->activity);
             }
+        } else if (ev.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
+            // Recentering moves the room coordinates with you: the game, its seat and its bar keep their
+            // place relative to the new centre (it stays in front of you), and an open menu follows.
+            trace("recentered");
+            recenterPending = true;
         } else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
             ANativeActivity_finish(app->activity);
         }

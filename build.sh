@@ -11,6 +11,9 @@ clang++ -std=c++20 -O2 -Wall -Wno-unused-parameter -I/opt/homebrew/include/SDL2 
 APP=~/Applications/PopUp16.app
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp frontend/popup16 snes9x/libretro/snes9x_libretro.dylib "$APP/Contents/Resources/"
+# the Snes9x license and copyright must travel with every copy, so the app carries all notices
+python3 tools/make_notices.py >/dev/null
+cp LICENSE THIRD_PARTY_NOTICES.txt "$APP/Contents/Resources/"
 cat > "$APP/Contents/MacOS/PopUp16" <<'SH'
 #!/bin/zsh
 RES="$(dirname "$0")/../Resources"
@@ -33,5 +36,5 @@ cat > "$APP/Contents/Info.plist" <<'PL'
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 PL
-codesign --force --deep -s - "$APP" >/dev/null 2>&1 || true
+codesign --force --deep -s - "$APP" >/dev/null 2>&1 || echo "warning: ad-hoc signing failed; the app still runs from this Mac"
 echo "built $APP"

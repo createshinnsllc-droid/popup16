@@ -303,4 +303,12 @@ Of the three scopes the owner selected: **release hardening** is done and verifi
 
 | Wedge, part 2 | Quest restarts the app's main loop inside the same process when you leave to Home and come back; room-view handles and entry points from the old instance survived and failed with `XR_ERROR_HANDLE_INVALID` (-12), so the room never returned. They are now reset with each new instance, destroyed with the session, and rebuilt if a handle goes bad | On the headset (worn state simulated): 3 leave-to-Home / return cycles in room mode: room off on leave, on again on return, session FOCUSED every time, 0 `PassthroughLayerGetId failed`, 120 Hz |
 
+| F5 recenter | Recentering re-places an open menu in front of you; the game, seat and bar keep their place relative to the new centre | Code path (reference-space-change event) |
+| F8 names/thumbnails | Games load only by plain file name inside the ROM folder; save-slot thumbnails must be 16..1024 px on each side | Build + code review |
+| F9 stale builds | Frames handed to the build thread carry the game generation; a build finished for the previous game is dropped instead of shown | Build + code review |
+| F7 Mac notices | The Mac app bundle now carries `LICENSE` and `THIRD_PARTY_NOTICES.txt`; a failed ad-hoc signing is reported | `~/Applications/PopUp16.app/Contents/Resources` lists both |
+| Look cost | Shadow/edge/haze baking reads the quads directly (no per-slice scratch buffers) | Output pixel-identical on 4 games; 0.74-1.0 ms -> 0.55-0.78 ms on the Mac |
+| Panels | Pause pages get a panel only as tall as their content; a pointer dot shows where you point | Panel snapshot from the headset |
+| Hires | 512-wide frames rebuild exactly | New regression case `dkc-hires` (0 of 114,688 px); suite now 17/17, runner self-test 13/13 |
+
 Still needs the owner: VR comfort and readability, and creating the release key.

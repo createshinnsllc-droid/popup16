@@ -278,58 +278,51 @@ struct Builder {
         map7Dirty = true;
     }
 
-    // per-pixel disparity of every sheet pixel, and the nearest disparity at each screen position
-    std::vector<float> own, nearest;
+    // nearest disparity at each screen position, padded by PAD so the shadow taps need no bounds checks
+    static const int PAD = 4;
+    std::vector<float> nearest;
 
+    // Works straight from the quads (each sheet's row spans) instead of per-slice scratch buffers:
+    // every sheet pixel is visited once to find what is nearest, then once to light it.
     void bakeLook(unsigned w, unsigned h) {
-        const size_t plane = (size_t)w * h;  // only the visible frame area
-        own.assign((size_t)SLICES * plane, 1e9f);
-        nearest.assign(plane, 1e9f);
+        const int pw = (int)w + PAD;
+        nearest.assign((size_t)pw * (h + PAD), 1e9f);
         for (const auto &q : quads) {
-            int s = (int)q.slice, y = (int)q.v;
-            uint32_t *row = slice(s) + (size_t)y * TEX_W;
+            const uint32_t *row = slice((int)q.slice) + (size_t)q.v * TEX_W;
+            float *nr = &nearest[(size_t)((int)q.v + PAD) * pw + PAD];
+            const uint32_t z = (uint32_t)q.z;
             for (int x = (int)q.u0; x < (int)q.u1; x++)
-                if ((row[x] >> 24) == (uint32_t)q.z) {
-                    own[(size_t)s * plane + (size_t)y * w + x] = q.disparity;
-                    float &n = nearest[(size_t)y * w + x];
-                    if (q.disparity < n) n = q.disparity;
-                }
+                if ((row[x] >> 24) == z && q.disparity < nr[x]) nr[x] = q.disparity;
         }
-        auto nearAt = [&](int x, int y) {
-            if (x < 0 || y < 0 || x >= (int)w || y >= (int)h) return 1e9f;
-            return nearest[(size_t)y * w + x];
-        };
-        for (int s = 0; s < SLICES; s++) {
-            uint32_t *t = slice(s);
-            const float *od = &own[(size_t)s * plane];
-            for (int y = 0; y < (int)h; y++)
-                for (int x = 0; x < (int)w; x++) {
-                    size_t i = (size_t)y * TEX_W + x;
-                    float d = od[(size_t)y * w + x];
-                    if (d > 1e8f) continue;
-                    uint32_t c = t[i], z = c >> 24;
-                    float r = (float)(c & 255), g = (float)((c >> 8) & 255), b = (float)((c >> 16) & 255);
-                    float k = 1.0f;
-                    // drop shadow: a nearer sheet up-left of here blocks the light (two taps = soft edge)
-                    float gap1 = d - nearAt(x - 2, y - 2), gap2 = d - nearAt(x - 4, y - 4);
-                    float sh = 0.5f * (std::clamp(gap1 / 1.5f, 0.0f, 1.0f) + std::clamp(gap2 / 1.5f, 0.0f, 1.0f));
-                    k -= look.shadow * sh;
-                    // cut-paper edge on everything except the backdrop
-                    if (s != 5) {
-                        auto same = [&](int xx, int yy) {
-                            if (xx < 0 || yy < 0 || xx >= (int)w || yy >= (int)h) return true;
-                            return (t[(size_t)yy * TEX_W + xx] >> 24) == z;
-                        };
-                        if (!same(x - 1, y) || !same(x, y - 1)) k += look.rim;
-                        else if (!same(x + 1, y) || !same(x, y + 1)) k -= look.rim;
+        const float shadowK = look.shadow * 0.5f / 1.5f;
+        for (const auto &q : quads) {
+            const int s = (int)q.slice, y = (int)q.v;
+            uint32_t *row = slice(s) + (size_t)y * TEX_W;
+            const uint32_t *up = y > 0 ? row - TEX_W : nullptr, *down = y + 1 < (int)h ? row + TEX_W : nullptr;
+            const float *n2 = &nearest[(size_t)(y - 2 + PAD) * pw + PAD - 2], *n4 = &nearest[(size_t)(y - 4 + PAD) * pw + PAD - 4];
+            const uint32_t z = (uint32_t)q.z;
+            const float d = q.disparity;
+            const float hz = std::clamp(d * look.haze, 0.0f, 0.22f);
+            const bool edges = s != 5;  // cut-paper edge on everything except the backdrop
+            for (int x = (int)q.u0; x < (int)q.u1; x++) {
+                uint32_t c = row[x];
+                if ((c >> 24) != z) continue;
+                // drop shadow: a nearer sheet up-left of here blocks the light (two taps = soft edge)
+                float g1 = std::clamp(d - n2[x], 0.0f, 1.5f), g2 = std::clamp(d - n4[x], 0.0f, 1.5f);
+                float k = 1.0f - shadowK * (g1 + g2);
+                if (edges) {
+                    bool l = x == 0 || (row[x - 1] >> 24) == z, u = !up || (up[x] >> 24) == z;
+                    if (!l || !u) k += look.rim;
+                    else {
+                        bool r = x + 1 >= (int)w || (row[x + 1] >> 24) == z, dn = !down || (down[x] >> 24) == z;
+                        if (!r || !dn) k -= look.rim;
                     }
-                    r *= k; g *= k; b *= k;
-                    // distance haze toward a cool tint
-                    float hz = std::clamp(d * look.haze, 0.0f, 0.22f);
-                    r += (150.0f - r) * hz; g += (170.0f - g) * hz; b += (200.0f - b) * hz;
-                    auto cl = [](float v) { return (uint32_t)std::clamp(v, 0.0f, 255.0f); };
-                    t[i] = cl(r) | (cl(g) << 8) | (cl(b) << 16) | (z << 24);
                 }
+                float r = (float)(c & 255) * k, g = (float)((c >> 8) & 255) * k, b = (float)((c >> 16) & 255) * k;
+                r += (150.0f - r) * hz; g += (170.0f - g) * hz; b += (200.0f - b) * hz;
+                auto cl = [](float v) { return (uint32_t)(v < 0 ? 0 : v > 255 ? 255 : v); };
+                row[x] = cl(r) | (cl(g) << 8) | (cl(b) << 16) | (z << 24);
+            }
         }
     }
 };

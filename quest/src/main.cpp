@@ -274,7 +274,7 @@ void android_main(android_app *app) {
                 headYaw = atan2f(-f.x, -f.z);
             }
             static bool placedOnce = false;
-            if (!placedOnce) { placeMenu(); placedOnce = true; }
+            if (!placedOnce || recenterPending) { placeMenu(); placedOnce = true; recenterPending = false; }
         }
         renderer.shapes.clear();
         pointerUpdate(fs.predictedDisplayTime);
@@ -391,6 +391,7 @@ void android_main(android_app *app) {
                 for (int n = 0; n < 5; n++) { j.planeColor[n] = planeColor[n]; j.planeZ[n] = planeZ[n]; }
                 j.lines = m7lines; j.vram = m7vram; j.cgram = m7cgram; j.flags = m7flags;
                 j.ramp = on(cfg.mode7Ramp); j.look = on(cfg.popLook); j.backdrop = on(cfg.sky) || !on(cfg.room);
+                j.gen = gameGen;
                 worker.hasJob = true;
             }
             worker.cv.notify_one();
@@ -399,6 +400,11 @@ void android_main(android_app *app) {
         {   // upload the newest finished build
             int r;
             { std::lock_guard<std::mutex> l(worker.m); r = worker.ready; worker.ready = -1; worker.uploading = r; }
+            if (r >= 0 && worker.builtGen[r] != gameGen) {  // built from the previous game: drop it
+                std::lock_guard<std::mutex> l(worker.m);
+                worker.uploading = -1;
+                r = -1;
+            }
             if (r >= 0) {
                 diorama::Builder &b = worker.builders[r];
                 renderer.haze = b.look.on ? b.look.haze : 0.0f;
@@ -423,8 +429,8 @@ void android_main(android_app *app) {
         if (menuMode == MENU_ARRANGE) arrangeUpdate(fs.predictedDisplayTime);
         setPassthrough(on(cfg.room) && hasPassthrough);
         XrCompositionLayerPassthroughFB ptLayer{XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_FB};
-        XrCompositionLayerQuad quads[1];
-        const XrCompositionLayerBaseHeader *layers[3];
+        XrCompositionLayerQuad quads[2];
+        const XrCompositionLayerBaseHeader *layers[4];
         uint32_t nl = 0;
         bool roomVisible = passthroughRunning && passthroughLayer != XR_NULL_HANDLE && fs.shouldRender;
         if (roomVisible) {
@@ -488,14 +494,32 @@ void android_main(android_app *app) {
             } else if (menuMode == MENU_ARRANGE) {  // small hint card low in view, out of the way of the game
                 q.pose.position = {0.0f, -0.55f, -1.0f};
                 q.size = {0.6f, 0.6f * MENU_H / MENU_W};
-            } else {  // the menu panel, placed in front of you when it opened
-                q.pose.position = menuPos;
+            } else {  // the menu panel, placed in front of you when it opened, as tall as its page
+                XrVector3f pc; float ph;
+                panelFrame(pc, ph);
+                q.subImage.imageRect = {{0, MENU_H - panelH}, {MENU_W, panelH}};  // GL rows count from the bottom
+                q.pose.position = pc;
                 q.pose.orientation = {menuRot.x, menuRot.y, menuRot.z, menuRot.w};
-                q.size = {MENU_WM, MENU_HM};
+                q.size = {MENU_WM, ph};
                 q.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;  // rounded corners
             }
             layers[nl] = (XrCompositionLayerBaseHeader *)&q;
             nl++;
+            if (!notice && menuMode != MENU_ARRANGE && ptr.hover && cursorSwap.handle) {  // the pointer dot on the panel
+                XrVector3f pc; float ph;
+                panelFrame(pc, ph);
+                XrCompositionLayerQuad &c = quads[1];
+                c = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+                c.space = localSpace;
+                c.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                c.subImage.swapchain = cursorSwap.handle;
+                c.subImage.imageRect = {{0, 0}, {32, 32}};
+                c.pose.position = vadd(pc, qrot(menuRot, v3(ptr.lx, ptr.ly, 0.003f)));
+                c.pose.orientation = {menuRot.x, menuRot.y, menuRot.z, menuRot.w};
+                c.size = {0.016f, 0.016f};
+                c.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                layers[nl++] = (XrCompositionLayerBaseHeader *)&c;
+            }
         }
         statFrames++;
         if (nowSec() - statT >= 5.0) {

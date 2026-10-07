@@ -30,6 +30,8 @@ CASES = (
     ("battle-cars", "Battle Cars.sfc"),
     ("f1-roc", "F1 ROC II - Race of Champions.sfc"),
     ("layer-test", None),
+    # the 512-wide high-resolution intro screen ("Nintendo presents"), exactness only
+    ("dkc-hires", "Donkey Kong Country.sfc", 700, 512),
 )
 
 
@@ -272,7 +274,10 @@ def main():
     fixture = out / "layertest.sfc"
     subprocess.run([sys.executable, str(ROOT / "test/make_test_rom.py"), str(fixture)], check=True)
     results = []
-    for key, filename in CASES:
+    for case in CASES:
+        key, filename = case[0], case[1]
+        frames_override = case[2] if len(case) > 2 else None
+        want_width = case[3] if len(case) > 3 else None
         rom = args.rom_dir / filename if filename and args.rom_dir else (fixture if not filename else None)
         if rom is None or not rom.is_file():
             results.append({"case": key, "status": "BLOCKED", "reason": "owned fixture missing"})
@@ -280,12 +285,15 @@ def main():
             continue
         rom = rom.resolve()
         original_hash = digest(rom)
-        for rewind in (False, True):
+        for rewind in ((False,) if frames_override else (False, True)):
             dest = out / (key + ("-rewind" if rewind else "-exactness"))
-            result = execute(binary, core, rom, dest, args.rewind_frames if rewind else args.frames, rewind)
+            frames = frames_override or (args.rewind_frames if rewind else args.frames)
+            result = execute(binary, core, rom, dest, frames, rewind)
             result.update(case=key, rom_sha256=original_hash)
             try:
                 result["verdict"] = verdict(result, dest)
+                if want_width and result["verdict"]["dimensions"][0] != want_width:
+                    raise ValueError("expected a %d-pixel-wide frame, got %s" % (want_width, result["verdict"]["dimensions"]))
                 if digest(rom) != original_hash: raise ValueError("source ROM hash changed")
                 result["status"] = "PASS"
             except (ValueError, OSError) as exc:

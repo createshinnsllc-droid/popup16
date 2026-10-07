@@ -20,11 +20,13 @@ struct BuildWorker {
         std::vector<uint16_t> cgram;
         int flags = 0;
         bool ramp = true, look = true, backdrop = true;
+        unsigned gen = 0;          // game generation this frame belongs to
     };
     Job job;                      // filled by the display loop under lock
     bool hasJob = false, quit = false;
     diorama::Builder builders[3];     // three, so building never touches the one waiting or uploading
     int ready = -1, uploading = -1;   // finished build waiting for upload; build being uploaded
+    unsigned builtGen[3] = {0, 0, 0}; // game generation each builder last built
     std::mutex m;
     std::condition_variable cv;
     std::thread th;
@@ -51,6 +53,7 @@ struct BuildWorker {
             b.mode7Ramp = local.ramp; b.look.on = local.look; b.showBackdrop = local.backdrop;
             b.build(din);
             std::lock_guard<std::mutex> l(m);
+            builtGen[target] = local.gen;
             ready = target;
         }
     }
@@ -179,8 +182,12 @@ static void unloadGame() {
     gameLoaded = false;
     frame.valid = false;
 }
+static unsigned gameGen = 0;  // bumped on every game load; tags frames handed to the build thread
 static bool loadGame(const std::string &name) {
+    // only plain file names from the ROM folder (never a path that could leave it)
+    if (name.empty() || name.find('/') != std::string::npos || name == "." || name == "..") return false;
     unloadGame();
+    gameGen++;
     std::vector<uint8_t> rom;
     std::string path = romDir + "/" + name;
     if (!readFile(path, rom)) { LOGE("cannot read %s", path.c_str()); return false; }
