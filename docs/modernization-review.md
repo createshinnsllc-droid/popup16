@@ -288,3 +288,18 @@ Keep the native renderer and pixel-correct sheets. The browser demonstrates voca
 The Quest arm64 build is proven to compile (`./quest/build_apk.sh`, exit 0), the hardened APK was installed through the app-only updater with data proven unchanged, and the app was launched and observed running without crashes. No worn-headset test, native menu snapshot, real MP4 playback or signed release was done. Data-safety items F2, F3, F6 and the notices half of F7 are fixed and verified as described above. Still open: F1's legacy installer, F4's codec/muxer error handling, F5's seat geometry, F8's bounds, F9's resource budgets, hires/interlaced/direct-color/EXTBG coverage, and release signing.
 
 Of the three scopes the owner selected: **release hardening** is done and verified, **everyday polish** is partially done (aspect-correct covers, plus the seat work), and **Diorama Studio** is not done — there are still no human-readable depth presets with a paused-frame Apply/Cancel, and no per-game preset storage. The browser prototype remains a design proof. Pointer feel, panel readability and depth comfort cannot be judged from screenshots or from a log; they need the owner wearing the headset. No accounts are needed for any of this. SideQuest, online achievements, widescreen core changes, Scene API and stereo clips remain separately approved projects. License obligations require artifact-level review before distribution; this document is not legal advice.
+
+
+## Follow-up fixes by Claude (same branch)
+
+| Finding | What changed | Proof |
+|---|---|---|
+| F1 installer | `install_quest.sh` rewritten: never deletes; refuses (and changes nothing) if a folder is not app-owned; copies only missing games/covers; `.sfc` and `.smc`; `pipefail`; old-save migration is opt-in and never overwrites | Run against the real headset: data fingerprint `ef330f9d…` identical before and after; "0 copied, 241 already there" for games and covers |
+| F2 capture | Fixed 512x448 canvas: every frame is scaled onto it, so hires/normal/interlaced frames mix in one clip instead of being refused; never enqueues a truncated buffer; muxer results checked; history capped at 192 MiB of packed frames; encode rate snapshotted per save; file written as `*.writing.mp4` and renamed only when complete (the shared Movies folder rejects non-video names) | 25 s DKC clip spanning the 512-wide "Nintendo Presents" and 256-wide frames: h264 512x448, 1484 frames, AAC 24.7 s, both sizes correct in extracted frames |
+| F3 resume | A resume state that fails to restore is no longer reported as resumed; the player is told and the game starts from its last save | Code path; device run resumed DKC normally |
+| F8 settings | Every setting has a valid range; out-of-range or non-finite values keep the default; per-game values reset to defaults before a game's own file loads | Build + code review |
+| F7 signing | `quest/make_release_key.sh` (owner runs it, chooses the password); `RELEASE_KEYSTORE=… build_apk.sh` signs with it and refuses DEV builds; `*.jks` / `*.keystore` git-ignored | Script only; no key created |
+| Structure | `main.cpp` split into 12 ordered `app_*.h` modules (522-line `main.cpp`) | Compiled text segment identical in size before and after (3,409,240 bytes) |
+
+Still needs the owner: the worn-headset check of the passthrough wedge fix, VR comfort and readability,
+and creating the release key.
