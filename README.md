@@ -17,6 +17,8 @@ own depth, like a pop-up book. Move your head and the scene has real parallax.
   track map at headset resolution. Racers stand on it; skylines sit beyond the horizon.
 - **Comfort limits** scaled to your eye spacing, so your eyes never have to diverge.
 - 60 fps emulation on a 120 Hz display; quick resume where you left off.
+- Capture: screenshots (sharp flat PNG plus side-by-side 3D) and "save the last 30 seconds" as an
+  MP4 with sound, written to the headset's Pictures/PopUp16 and Movies/PopUp16 folders.
 - Rewind (hold the left stick in), slow motion and fast speeds, four save slots with pictures.
 - Mixed reality: place the game in your room, carry it, resize it, peek into the pop-up box.
 - **Library:** cover grid with Recent, Favorites and All tabs; playtime and last played per game.
@@ -80,4 +82,6 @@ code: Snes9x and the other components keep their own licenses, listed in full in
 that include the Snes9x core may not be sold. Super NES and Super Nintendo Entertainment System are
 trademarks of Nintendo; this project is not affiliated with or endorsed by Nintendo.
 
-Made by TyDroElite / CreateShinns LLC.
+Made by TyDroElite / CreateShinns LLC. If PopUp16 made your games feel new again, you can
+support development at **[ko-fi.com/createshinns](https://ko-fi.com/createshinns)**. Donations are
+optional and unlock nothing; PopUp16 stays free.

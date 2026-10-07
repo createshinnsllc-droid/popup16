@@ -44,6 +44,7 @@
 #include "renderer.h"
 #include "../../shared/rewind.h"
 #include "../../shared/png.h"
+#include "capture.h"
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "PopUp16", __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "PopUp16", __VA_ARGS__)
@@ -141,9 +142,13 @@ static double resampleStep = 32040.5 / OUT_RATE, resamplePos = 0.0;
 static int16_t prevL = 0, prevR = 0;
 static AAudioStream *aaStream = nullptr;
 static bool muteAudio = false;  // rewind plays back silently
+static capture::Recorder recorder;  // last 30 s of frames and sound for clips
+static void recordAudio(int16_t l, int16_t r) { if (!muteAudio) recorder.pushAudio(l, r); }
 
 static uint32_t ringFill() { return ringW.load(std::memory_order_acquire) - ringR.load(std::memory_order_acquire); }
+static void recordAudio(int16_t l, int16_t r);
 static void pushOut(int16_t l, int16_t r) {
+    recordAudio(l, r);
     uint32_t w = ringW.load(std::memory_order_relaxed);
     if (w - ringR.load(std::memory_order_acquire) >= RING) return;  // full: drop
     ring[(w & (RING - 1)) * 2] = l; ring[(w & (RING - 1)) * 2 + 1] = r;
@@ -193,7 +198,7 @@ enum Phys { PH_RA, PH_RB, PH_RTRIG, PH_RGRIP, PH_RCLICK, PH_LX, PH_LTRIG, PH_LGR
 static const char *physNames[PH_COUNT] = {"right A", "right B", "right trigger", "right grip", "right stick click",
     "left X", "left trigger", "left grip", "left menu", "left stick click",
     "pad A", "pad B", "pad X", "pad Y", "pad L1", "pad R1", "pad L2", "pad R2", "pad Start", "pad Select"};
-enum { ACT_NONE = -1, ACT_REWIND = 100, ACT_FAST = 101 };  // otherwise a B_* SNES button
+enum { ACT_NONE = -1, ACT_REWIND = 100, ACT_FAST = 101, ACT_SHOT = 102, ACT_CLIP = 103 };  // otherwise a B_* SNES button
 static const int defaultMap[PH_COUNT] = {B_B, B_A, B_Y, B_R, B_START, B_SELECT, B_X, B_L, B_START, ACT_REWIND,
                                          B_B, B_A, B_Y, B_X, B_L, B_R, ACT_REWIND, ACT_FAST, B_START, B_SELECT};
 static int mapping[PH_COUNT];
@@ -213,16 +218,19 @@ static void dpadFrom(bool *b) {  // D-pad: either Touch stick, the gamepad's D-p
     b[B_LEFT] = stickX < -0.5f || padDpad[2] || padAxisX < -0.5f;
     b[B_RIGHT] = stickX > 0.5f || padDpad[3] || padAxisX > 0.5f;
 }
+static bool wantShot = false, wantClip = false;  // capture buttons held this frame
 static void gameButtons(bool *b, bool &rewind, bool &fast) {  // what the game sees, through the mapping
     memset(b, 0, sizeof(bool) * B_COUNT);
     dpadFrom(b);
-    rewind = fast = false;
+    rewind = fast = wantShot = wantClip = false;
     for (int i = 0; i < PH_COUNT; i++) {
         if (!physDown[i]) continue;
         int a = mapping[i];
         if (a >= 0 && a < B_COUNT) b[a] = true;
         else if (a == ACT_REWIND) rewind = true;
         else if (a == ACT_FAST) fast = true;
+        else if (a == ACT_SHOT) wantShot = true;
+        else if (a == ACT_CLIP) wantClip = true;
     }
 }
 static void menuButtons(bool *b) {  // fixed: A select, B back, grips/L1-R1 tabs, left X / pad Y favourite
@@ -353,6 +361,12 @@ static bool environment(unsigned cmd, void *data) {
 }
 static void video_cb(const void *data, unsigned w, unsigned h, size_t pitch) {
     if (!data) return;
+    if (!muteAudio) recorder.pushFrame([&] {  // tightly packed copy for the clip history
+        static std::vector<uint16_t> t;
+        t.resize(w * h);
+        for (unsigned y = 0; y < h; y++) memcpy(&t[y * w], (const uint8_t *)data + y * pitch, w * 2);
+        return t.data();
+    }(), w, h);
     frame.capture(data, w, h, pitch, snes3d_get_layers(), snes3d_get_depths());
     {
         const int16_t *l; const uint8_t *vr; const uint16_t *cg;
@@ -385,6 +399,7 @@ static int16_t input_state(unsigned port, unsigned device, unsigned, unsigned id
 }
 
 static Rewind rewinder;
+static std::string picturesDir, moviesDir;
 static double playedThisLoad = 0;  // seconds of play since the game was loaded (cover capture)
 static int framesSinceSnap = 0;
 static void runFrame() {  // one emulated frame, snapshotting every third for rewind
@@ -454,9 +469,11 @@ static bool loadGame(const std::string &name) {
     if (!retro_load_game(&gi)) { LOGE("core refused %s", name.c_str()); retro_deinit(); return false; }
     snes3d_enable_planes(1);
     rewinder.clear(); framesSinceSnap = 0;
+    recorder.clear();
     gameLoaded = true; gameName = name; gamePath = path;
     retro_system_av_info av; retro_get_system_av_info(&av);
     avFps = av.timing.fps; avRate = av.timing.sample_rate;
+    recorder.fps = avFps;
     resampleStep = avRate / OUT_RATE;
     std::vector<uint8_t> s;
     size_t n = retro_get_memory_size(RETRO_MEMORY_SAVE_RAM);
@@ -474,14 +491,59 @@ static bool loadGame(const std::string &name) {
     return true;
 }
 
+// ---------------------------------------------------------------- capture: screenshots and clips
+// Files go to the headset's shared Pictures/PopUp16 and Movies/PopUp16 folders (fallback: files/captures).
+static void showToast(const std::string &t);
+static std::string captureName() {
+    std::string n = stem();
+    for (auto &c : n) if (c == '/' || c == ':') c = '-';
+    char ts[32]; time_t t = time(nullptr); strftime(ts, sizeof ts, "%Y%m%d-%H%M%S", localtime(&t));
+    return n + "_" + ts;
+}
+static void takeScreenshot() {
+    if (!gameLoaded || !frame.valid) return;
+    std::string base = picturesDir + "/" + captureName();
+    // flat: every SNES pixel as a sharp 4x4 block
+    const int S = 4, W = frame.w * S, H = frame.h * S;
+    std::vector<uint8_t> rgb((size_t)W * H * 3);
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++) {
+            uint16_t c = frame.rgb565[(y / S) * frame.w + x / S];
+            uint8_t *p = &rgb[((size_t)y * W + x) * 3];
+            p[0] = ((c >> 11) & 31) * 255 / 31; p[1] = ((c >> 5) & 63) * 255 / 63; p[2] = (c & 31) * 255 / 31;
+        }
+    bool ok = png::writeRGB(base + ".png", W, H, rgb.data());
+    // 3D: left and right eye side by side, for 3D photo viewers and VR galleries
+    static uint32_t lut[65536];
+    static bool lutReady = false;
+    if (!lutReady) { stereo::makeLut(lut, true); lutReady = true; }
+    stereo::Params sp;
+    sp.strength = on(cfg.stereoOn) ? cfg.strength : 0.0f;
+    sp.convergence = cfg.convergence; sp.mode7Ramp = on(cfg.mode7Ramp);
+    std::vector<uint32_t> sbs;
+    unsigned oh = stereo::build(frame, sp, lut, sbs);
+    int sw = 2 * stereo::EYE_W;
+    std::vector<uint8_t> s3((size_t)sw * oh * 3);
+    for (size_t i = 0; i < (size_t)sw * oh; i++) { uint32_t c = sbs[i]; s3[i * 3] = c & 255; s3[i * 3 + 1] = (c >> 8) & 255; s3[i * 3 + 2] = (c >> 16) & 255; }
+    ok = png::writeRGB(base + "_3D-SBS.png", sw, (int)oh, s3.data()) && ok;
+    trace("screenshot %s %s", base.c_str(), ok ? "saved" : "FAILED");
+    showToast(ok ? "Screenshot saved (flat + 3D)" : "Could not save screenshot");
+}
+static void saveClip() {
+    if (!gameLoaded) return;
+    if (recorder.busy()) { showToast("Still saving the last clip..."); return; }
+    if (recorder.save(moviesDir + "/" + captureName() + ".mp4")) showToast("Saving the last 30 seconds...");
+}
+
 // ---------------------------------------------------------------- controls: mapping files and remapping
-static const int kActions[] = {B_B, B_Y, B_A, B_X, B_L, B_R, B_START, B_SELECT, ACT_REWIND, ACT_FAST};
+static const int kActions[] = {B_B, B_Y, B_A, B_X, B_L, B_R, B_START, B_SELECT, ACT_REWIND, ACT_FAST, ACT_SHOT, ACT_CLIP};
 static const int N_ACTIONS = sizeof(kActions) / sizeof(kActions[0]);
 static const char *actionName(int a) {
     switch (a) {
     case B_B: return "B (jump)"; case B_Y: return "Y (run)"; case B_A: return "A"; case B_X: return "X";
     case B_L: return "L"; case B_R: return "R"; case B_START: return "Start"; case B_SELECT: return "Select";
     case ACT_REWIND: return "Rewind (hold)"; case ACT_FAST: return "Fast-forward (hold)";
+    case ACT_SHOT: return "Screenshot"; case ACT_CLIP: return "Save last 30 s";
     default: return "-";
     }
 }
@@ -689,11 +751,12 @@ static const uint32_t C_BG = 0xff201812, C_TEXT = 0xffe0e0e0, C_DIM = 0xff909090
 
 
 enum PauseItem { P_RESUME, P_CONTROLS, P_SPEED, P_DEPTH, P_CONV, P_3D, P_MODE7, P_SWAP, P_ROOM, P_STYLE, P_LOOK, P_SKY,
-                 P_ARRANGE, P_RESET, P_SIZE, P_DIST, P_SAVE, P_LOAD, P_GAMES, P_ABOUT, PAUSE_N };
+                 P_ARRANGE, P_RESET, P_SIZE, P_DIST, P_SAVE, P_LOAD, P_SHOT, P_CLIP, P_GAMES, P_ABOUT, PAUSE_N };
 static const char *pauseItems[PAUSE_N] = {
     "Resume", "Controls & remapping", "Game speed", "3D depth", "Convergence", "3D on/off", "Mode 7 floor depth", "Swap eyes",
     "Surroundings", "3D style", "Pop-up look", "Show sky", "Move & resize...", "Reset position",
-    "Screen size", "Screen distance", "Save state", "Load state", "Choose game", "About & licenses"};
+    "Screen size", "Screen distance", "Save state", "Load state", "Take screenshot", "Save last 30 s as video",
+    "Choose game", "About & licenses"};
 static bool adjustable(int i) { return i == P_SPEED || i == P_DEPTH || i == P_CONV || i == P_SIZE || i == P_DIST; }
 static bool toggle(int i) { return i == P_3D || i == P_MODE7 || i == P_SWAP || i == P_ROOM || i == P_STYLE || i == P_LOOK || i == P_SKY; }
 static void defaultPlacement() {
@@ -755,6 +818,11 @@ static void drawSlots() {
 
 static void renderMenu() {
     std::fill(menuPixels.begin(), menuPixels.end(), C_BG);
+    if (menuMode == MENU_NONE) {  // playing: only a notice strip (see the small quad in the frame loop)
+        if (!toast.empty()) drawText(1, 1, toast.substr(0, COLS - 2), C_HI);
+        menuDirty = false;
+        return;
+    }
     char buf[160];
     if (menuMode == MENU_ROMS) {
         static const char *tabs[TAB_N] = {"Recent", "Favorites", "All games"};
@@ -1399,6 +1467,8 @@ static void menuInput(const bool *b) {
         case P_RESET: defaultPlacement(); saveGlobal(); showToast("Position reset"); break;
         case P_SAVE: menuMode = MENU_SLOTS; slotSaving = true; break;
         case P_LOAD: menuMode = MENU_SLOTS; slotSaving = false; break;
+        case P_SHOT: takeScreenshot(); break;
+        case P_CLIP: saveClip(); break;
         case P_GAMES: scanRoms(); saveStats(); buildLibView(); menuMode = MENU_ROMS; break;
         case P_ABOUT: menuMode = MENU_ABOUT; aboutTop = 0; break;
         }
@@ -1495,7 +1565,8 @@ void android_main(android_app *app) {
     {
         aboutLines = {"PopUp16 0.1 - layered 3D for 16-bit console games on Quest",
                       "Made by TyDroElite / CreateShinns LLC. Free, non-commercial software.",
-                      "Emulation by the Snes9x team. No games included.", "", ""};
+                      "Emulation by the Snes9x team. No games included.",
+                      "Support development (optional, unlocks nothing): ko-fi.com/createshinns", ""};
         if (AAsset *as = AAssetManager_open(app->activity->assetManager, "NOTICES.txt", AASSET_MODE_BUFFER)) {
             std::string text((const char *)AAsset_getBuffer(as), AAsset_getLength(as));
             AAsset_close(as);
@@ -1514,6 +1585,13 @@ void android_main(android_app *app) {
         }
         trace("about page: %d lines", (int)aboutLines.size());
     }
+    // shared media folders the Quest's own gallery and file browser show; app files as a fallback
+    picturesDir = "/sdcard/Pictures/PopUp16"; moviesDir = "/sdcard/Movies/PopUp16";
+    mkdir("/sdcard/Pictures", 0775); mkdir("/sdcard/Movies", 0775);
+    if (mkdir(picturesDir.c_str(), 0775) != 0 && access(picturesDir.c_str(), W_OK) != 0) picturesDir = filesDir + "/captures";
+    if (mkdir(moviesDir.c_str(), 0775) != 0 && access(moviesDir.c_str(), W_OK) != 0) moviesDir = filesDir + "/captures";
+    mkdir((filesDir + "/captures").c_str(), 0775);
+    trace("captures: %s, %s", picturesDir.c_str(), moviesDir.c_str());
     coverDir = filesDir + "/covers";
     mkdir(coverDir.c_str(), 0775);
     loadStats();
@@ -1602,6 +1680,10 @@ void android_main(android_app *app) {
                     menuMode = keep;
                     trace("menu dumped");
                 }
+                {
+                    std::string msg;
+                    if (recorder.takeResult(msg)) trace("clip: %s", msg.c_str());
+                }
                 if (access((filesDir + "/rewind_request").c_str(), F_OK) == 0) {  // debug: step back 300 snapshots (15 s)
                     remove((filesDir + "/rewind_request").c_str());
                     int n = 0; double r0 = nowSec();
@@ -1641,6 +1723,15 @@ void android_main(android_app *app) {
                 if (all[i] != last[i]) { trace("input SNES %s %s (menu mode %d, game %d)", names[i], all[i] ? "down" : "up", (int)menuMode, (int)gameLoaded); last[i] = all[i]; }
             if (xrMenu != lastMenu) { trace("input PopUp16-menu button %s", xrMenu ? "down" : "up"); lastMenu = xrMenu; }
         }
+        {   // debug (with files/debug_headless): capture requests from adb, also while the headset is worn
+            static bool dbg = access((filesDir + "/debug_headless").c_str(), F_OK) == 0;
+            static double nextCheck = 0;
+            if (dbg && nowSec() > nextCheck) {
+                nextCheck = nowSec() + 0.5;
+                if (access((filesDir + "/shot_request").c_str(), F_OK) == 0) { remove((filesDir + "/shot_request").c_str()); takeScreenshot(); }
+                if (access((filesDir + "/clip_request").c_str(), F_OK) == 0) { remove((filesDir + "/clip_request").c_str()); saveClip(); }
+            }
+        }
         bool menuBtn = xrMenu || padMenu || (physDown[PH_PAD_SELECT] && physDown[PH_PAD_START]);
         bool menuEdge = menuBtn && !prevMenuBtn;
         if (menuEdge && remapAction >= 0) { remapAction = -1; menuDirty = true; menuEdge = false; }  // cancels a remap
@@ -1668,6 +1759,12 @@ void android_main(android_app *app) {
             // pace by audio: keep ~3 video frames of sound queued
             uint32_t target = (uint32_t)(OUT_RATE / avFps * 3);
             int runs = 0;
+            {
+                static bool prevShot = false, prevClip = false;
+                if (wantShot && !prevShot) takeScreenshot();
+                if (wantClip && !prevClip) saveClip();
+                prevShot = wantShot; prevClip = wantClip;
+            }
             bool rewinding = wantRewind;
             // game speed: the emulator follows the audio clock, so stretching the audio slows the game
             float speed = std::clamp(cfg.speed * (wantFast ? 2.0f : 1.0f), 0.25f, 4.0f);
@@ -1744,7 +1841,12 @@ void android_main(android_app *app) {
                 worker.uploading = -1;
             }
         }
-        if (menuMode != MENU_NONE && (menuDirty || (!toast.empty() && nowSec() > toastUntil))) {
+        {
+            std::string msg;
+            if (recorder.takeResult(msg)) { showToast(msg); trace("clip: %s", msg.c_str()); }
+        }
+        if (menuMode == MENU_NONE && !toast.empty() && nowSec() > toastUntil) toast.clear();
+        if ((menuMode != MENU_NONE || !toast.empty()) && (menuDirty || (!toast.empty() && nowSec() > toastUntil))) {
             if (nowSec() > toastUntil) toast.clear();
             renderMenu();
             uploadSwap(menuSwap, menuPixels.data(), MENU_W, MENU_H);
@@ -1802,7 +1904,8 @@ void android_main(android_app *app) {
             proj.views = pviews;
             layers[nl++] = (XrCompositionLayerBaseHeader *)&proj;
         }
-        if (fs.shouldRender && menuMode != MENU_NONE) {
+        bool notice = menuMode == MENU_NONE && !toast.empty() && nowSec() < toastUntil;
+        if (fs.shouldRender && (menuMode != MENU_NONE || notice)) {
             XrCompositionLayerQuad &q = quads[0];
             q = {XR_TYPE_COMPOSITION_LAYER_QUAD};
             q.space = localSpace;
@@ -1810,7 +1913,12 @@ void android_main(android_app *app) {
             q.subImage.swapchain = menuSwap.handle;
             q.subImage.imageRect = {{0, 0}, {MENU_W, MENU_H}};
             q.pose.orientation.w = 1;
-            if (menuMode == MENU_ARRANGE) {  // small hint card low in view, out of the way of the game
+            if (notice) {  // in-game notice: the top strip of the menu image, small and low in view
+                const int stripH = 3 * CELL_H;
+                q.subImage.imageRect = {{0, MENU_H - stripH}, {MENU_W, stripH}};  // GL rows count from the bottom
+                q.pose.position = {0.0f, -0.45f, -1.1f};
+                q.size = {0.6f, 0.6f * stripH / MENU_W};
+            } else if (menuMode == MENU_ARRANGE) {  // small hint card low in view, out of the way of the game
                 q.pose.position = {0.0f, -0.55f, -1.0f};
                 q.size = {0.6f, 0.6f * MENU_H / MENU_W};
             } else {

@@ -1,7 +1,7 @@
-// Minimal PNG writer (8-bit RGB, deflate "stored" blocks): no compression library needed, so the
-// Mac tools and the Quest app can both write cover images that any decoder reads.
+// Minimal PNG writer (8-bit RGB) on zlib, which both macOS and Android ship.
 #pragma once
 #include <algorithm>
+#include <zlib.h>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -29,20 +29,10 @@ inline bool writeRGB(const std::string &path, int w, int h, const uint8_t *rgb) 
     std::vector<uint8_t> raw;
     raw.reserve((size_t)(w * 3 + 1) * h);
     for (int y = 0; y < h; y++) { raw.push_back(0); raw.insert(raw.end(), rgb + (size_t)y * w * 3, rgb + (size_t)(y + 1) * w * 3); }
-    std::vector<uint8_t> z = {0x78, 0x01};  // zlib header, then stored blocks of up to 65535 bytes
-    for (size_t pos = 0; pos < raw.size() || raw.empty();) {
-        size_t n = std::min<size_t>(65535, raw.size() - pos);
-        bool last = pos + n >= raw.size();
-        z.push_back(last ? 1 : 0);
-        z.push_back(n & 255); z.push_back(n >> 8); z.push_back(~n & 255); z.push_back((~n >> 8) & 255);
-        z.insert(z.end(), raw.begin() + pos, raw.begin() + pos + n);
-        pos += n;
-        if (last) break;
-    }
-    uint32_t a = 1, b = 0;
-    for (uint8_t v : raw) { a = (a + v) % 65521; b = (b + a) % 65521; }
-    uint32_t adler = (b << 16) | a;
-    for (int i = 3; i >= 0; i--) z.push_back((adler >> (i * 8)) & 255);
+    uLongf zn = compressBound((uLong)raw.size());
+    std::vector<uint8_t> z(zn);
+    if (compress2(z.data(), &zn, raw.data(), (uLong)raw.size(), 6) != Z_OK) return false;
+    z.resize(zn);
 
     std::vector<uint8_t> out = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
     auto chunk = [&](const char *type, const std::vector<uint8_t> &data) {

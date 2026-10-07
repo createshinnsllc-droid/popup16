@@ -7,7 +7,7 @@ brew list sdl2 >/dev/null 2>&1 || brew install sdl2
 make -C snes9x/libretro platform=osx clean >/dev/null
 make -C snes9x/libretro -j8 platform=osx
 clang++ -std=c++20 -O2 -Wall -Wno-unused-parameter -I/opt/homebrew/include/SDL2 -Isnes9x/libretro \
-  frontend/popup16.cpp -L/opt/homebrew/lib -lSDL2 -o frontend/popup16
+  frontend/popup16.cpp -L/opt/homebrew/lib -lSDL2 -lz -o frontend/popup16
 APP=~/Applications/PopUp16.app
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp frontend/popup16 snes9x/libretro/snes9x_libretro.dylib "$APP/Contents/Resources/"
