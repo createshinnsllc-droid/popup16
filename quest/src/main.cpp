@@ -186,27 +186,66 @@ static void stopAudio() {
 
 // ---------------------------------------------------------------- input
 enum { B_B, B_Y, B_SELECT, B_START, B_UP, B_DOWN, B_LEFT, B_RIGHT, B_A, B_X, B_L, B_R, B_COUNT };  // RETRO_DEVICE_ID_JOYPAD order
-static bool xrButtons[B_COUNT], padButtons[B_COUNT];
+// Physical buttons (Touch controllers and gamepad) and what each does in a game. Left Y and the
+// gamepad's menu button always open the PopUp16 menu; menus always use the fixed buttons below.
+enum Phys { PH_RA, PH_RB, PH_RTRIG, PH_RGRIP, PH_RCLICK, PH_LX, PH_LTRIG, PH_LGRIP, PH_LMENU, PH_LCLICK,
+            PH_PAD_A, PH_PAD_B, PH_PAD_X, PH_PAD_Y, PH_PAD_L1, PH_PAD_R1, PH_PAD_L2, PH_PAD_R2, PH_PAD_START, PH_PAD_SELECT, PH_COUNT };
+static const char *physNames[PH_COUNT] = {"right A", "right B", "right trigger", "right grip", "right stick click",
+    "left X", "left trigger", "left grip", "left menu", "left stick click",
+    "pad A", "pad B", "pad X", "pad Y", "pad L1", "pad R1", "pad L2", "pad R2", "pad Start", "pad Select"};
+enum { ACT_NONE = -1, ACT_REWIND = 100, ACT_FAST = 101 };  // otherwise a B_* SNES button
+static const int defaultMap[PH_COUNT] = {B_B, B_A, B_Y, B_R, B_START, B_SELECT, B_X, B_L, B_START, ACT_REWIND,
+                                         B_B, B_A, B_Y, B_X, B_L, B_R, ACT_REWIND, ACT_FAST, B_START, B_SELECT};
+static int mapping[PH_COUNT];
+static bool physDown[PH_COUNT];
+static bool controlsPerGame = false;  // mapping saved for this game only
+static void loadMapping(const std::string &path);
 static bool padMenu = false, xrMenu = false;
-static bool padRewind = false, padFast = false, xrRewind = false;
 static float navX = 0, navY = 0, trigRValue = 0;  // menu: right stick X, left stick Y, right trigger
+static float stickX = 0, stickY = 0;              // strongest Touch thumbstick, for the D-pad
+static bool padDpad[4];                           // up down left right
 static float padAxisX = 0, padAxisY = 0;
 static bool joypad[B_COUNT];
 
-static int keyToButton(int32_t key) {
+static void dpadFrom(bool *b) {  // D-pad: either Touch stick, the gamepad's D-pad or left stick
+    b[B_UP] = stickY > 0.5f || padDpad[0] || padAxisY < -0.5f;
+    b[B_DOWN] = stickY < -0.5f || padDpad[1] || padAxisY > 0.5f;
+    b[B_LEFT] = stickX < -0.5f || padDpad[2] || padAxisX < -0.5f;
+    b[B_RIGHT] = stickX > 0.5f || padDpad[3] || padAxisX > 0.5f;
+}
+static void gameButtons(bool *b, bool &rewind, bool &fast) {  // what the game sees, through the mapping
+    memset(b, 0, sizeof(bool) * B_COUNT);
+    dpadFrom(b);
+    rewind = fast = false;
+    for (int i = 0; i < PH_COUNT; i++) {
+        if (!physDown[i]) continue;
+        int a = mapping[i];
+        if (a >= 0 && a < B_COUNT) b[a] = true;
+        else if (a == ACT_REWIND) rewind = true;
+        else if (a == ACT_FAST) fast = true;
+    }
+}
+static void menuButtons(bool *b) {  // fixed: A select, B back, grips/L1-R1 tabs, left X / pad Y favourite
+    memset(b, 0, sizeof(bool) * B_COUNT);
+    dpadFrom(b);
+    b[B_B] = physDown[PH_RA] || physDown[PH_PAD_A];
+    b[B_A] = physDown[PH_RB] || physDown[PH_PAD_B];
+    b[B_L] = physDown[PH_LGRIP] || physDown[PH_PAD_L1];
+    b[B_R] = physDown[PH_RGRIP] || physDown[PH_PAD_R1];
+    b[B_SELECT] = physDown[PH_LX] || physDown[PH_PAD_Y];
+}
+static int keyToPhys(int32_t key) {
     switch (key) {
-    case AKEYCODE_BUTTON_A: return B_B;
-    case AKEYCODE_BUTTON_B: return B_A;
-    case AKEYCODE_BUTTON_X: return B_Y;
-    case AKEYCODE_BUTTON_Y: return B_X;
-    case AKEYCODE_BUTTON_L1: return B_L;
-    case AKEYCODE_BUTTON_R1: return B_R;
-    case AKEYCODE_BUTTON_START: return B_START;
-    case AKEYCODE_BUTTON_SELECT: return B_SELECT;
-    case AKEYCODE_DPAD_UP: return B_UP;
-    case AKEYCODE_DPAD_DOWN: return B_DOWN;
-    case AKEYCODE_DPAD_LEFT: return B_LEFT;
-    case AKEYCODE_DPAD_RIGHT: return B_RIGHT;
+    case AKEYCODE_BUTTON_A: return PH_PAD_A;
+    case AKEYCODE_BUTTON_B: return PH_PAD_B;
+    case AKEYCODE_BUTTON_X: return PH_PAD_X;
+    case AKEYCODE_BUTTON_Y: return PH_PAD_Y;
+    case AKEYCODE_BUTTON_L1: return PH_PAD_L1;
+    case AKEYCODE_BUTTON_R1: return PH_PAD_R1;
+    case AKEYCODE_BUTTON_L2: return PH_PAD_L2;
+    case AKEYCODE_BUTTON_R2: return PH_PAD_R2;
+    case AKEYCODE_BUTTON_START: return PH_PAD_START;
+    case AKEYCODE_BUTTON_SELECT: return PH_PAD_SELECT;
     default: return -1;
     }
 }
@@ -216,11 +255,11 @@ static int32_t onInput(android_app *, AInputEvent *e) {
         int32_t key = AKeyEvent_getKeyCode(e);
         bool down = AKeyEvent_getAction(e) == AKEY_EVENT_ACTION_DOWN;
         if (key == AKEYCODE_BUTTON_MODE || key == AKEYCODE_BUTTON_THUMBL) { padMenu = down; return 1; }
-        if (key == AKEYCODE_BUTTON_L2) { padRewind = down; return 1; }   // hold to rewind
-        if (key == AKEYCODE_BUTTON_R2) { padFast = down; return 1; }     // hold to fast-forward
-        int b = keyToButton(key);
         trace("gamepad key %d %s", key, down ? "down" : "up");
-        if (b >= 0) { padButtons[b] = down; return 1; }
+        int d = key == AKEYCODE_DPAD_UP ? 0 : key == AKEYCODE_DPAD_DOWN ? 1 : key == AKEYCODE_DPAD_LEFT ? 2 : key == AKEYCODE_DPAD_RIGHT ? 3 : -1;
+        if (d >= 0) { padDpad[d] = down; return 1; }
+        int ph = keyToPhys(key);
+        if (ph >= 0) { physDown[ph] = down; return 1; }
     } else if (type == AINPUT_EVENT_TYPE_MOTION && (AInputEvent_getSource(e) & AINPUT_SOURCE_JOYSTICK)) {
         float hx = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_HAT_X, 0);
         float hy = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_HAT_Y, 0);
@@ -365,6 +404,9 @@ static bool rewindStep() {  // one step back in history, shown by running one si
 }
 
 static std::string stem() { return gameName.substr(0, gameName.find_last_of('.')); }
+static std::string controlsPath(bool perGame) {
+    return perGame && gameLoaded ? saveDir + "/" + stem() + ".controls" : filesDir + "/controls.cfg";
+}
 static void saveSram() {
     if (!gameLoaded) return;
     size_t n = retro_get_memory_size(RETRO_MEMORY_SAVE_RAM);
@@ -420,11 +462,86 @@ static bool loadGame(const std::string &name) {
     size_t n = retro_get_memory_size(RETRO_MEMORY_SAVE_RAM);
     if (n && readFile(saveDir + "/" + stem() + ".srm", s) && s.size() == n) memcpy(retro_get_memory_data(RETRO_MEMORY_SAVE_RAM), s.data(), n);
     loadSettings(saveDir + "/" + stem() + ".cfg", false);
+    {
+        struct stat sb;
+        controlsPerGame = stat(controlsPath(true).c_str(), &sb) == 0;
+        loadMapping(controlsPath(controlsPerGame));
+    }
     trace("loaded %s (%.3f fps, %.1f Hz)", name.c_str(), avFps, avRate);
     stats[name].lastPlayed = (long)time(nullptr);
     saveStats();
     playedThisLoad = 0;
     return true;
+}
+
+// ---------------------------------------------------------------- controls: mapping files and remapping
+static const int kActions[] = {B_B, B_Y, B_A, B_X, B_L, B_R, B_START, B_SELECT, ACT_REWIND, ACT_FAST};
+static const int N_ACTIONS = sizeof(kActions) / sizeof(kActions[0]);
+static const char *actionName(int a) {
+    switch (a) {
+    case B_B: return "B (jump)"; case B_Y: return "Y (run)"; case B_A: return "A"; case B_X: return "X";
+    case B_L: return "L"; case B_R: return "R"; case B_START: return "Start"; case B_SELECT: return "Select";
+    case ACT_REWIND: return "Rewind (hold)"; case ACT_FAST: return "Fast-forward (hold)";
+    default: return "-";
+    }
+}
+static int remapAction = ACT_NONE;    // action waiting for a button press
+static bool remapArmed = false, remapJustDone = false;
+static std::string controlsPath(bool perGame);
+static void loadMapping(const std::string &path) {
+    memcpy(mapping, defaultMap, sizeof mapping);
+    FILE *f = fopen(path.c_str(), "r");
+    if (!f) return;
+    char name[64]; int a;
+    while (fscanf(f, " %63[^=]=%d", name, &a) == 2)
+        for (int i = 0; i < PH_COUNT; i++) if (!strcmp(physNames[i], name)) mapping[i] = a;
+    fclose(f);
+}
+static void saveMapping() {
+    FILE *f = fopen(controlsPath(controlsPerGame).c_str(), "w");
+    if (!f) return;
+    for (int i = 0; i < PH_COUNT; i++) fprintf(f, "%s=%d\n", physNames[i], mapping[i]);
+    fclose(f);
+}
+static std::string boundTo(int action) {  // "right A, pad A"
+    std::string r;
+    for (int i = 0; i < PH_COUNT; i++)
+        if (mapping[i] == action) r += (r.empty() ? "" : ", ") + std::string(physNames[i]);
+    return r.empty() ? "(none)" : r;
+}
+static std::vector<std::string> controlsHelp() {
+    std::vector<std::string> l = {"CONTROLS", "", "Move ............. either thumbstick (gamepad: D-pad)"};
+    for (int k = 0; k < N_ACTIONS; k++) {
+        std::string n = actionName(kActions[k]);
+        n += " " + std::string(std::max<int>(1, 17 - (int)n.size()), '.') + " ";
+        l.push_back(n + boundTo(kActions[k]));
+    }
+    l.push_back("PopUp16 menu ..... left Y (gamepad: menu, or Select+Start)");
+    l.push_back("");
+    l.push_back("Change any of these: menu > Controls & remapping.");
+    l.push_back("Press any button to play.");
+    return l;
+}
+// waiting for the button to assign: everything must be released first, then the next press wins
+static void remapCapture() {
+    if (remapJustDone) {  // let go of the assigned button before menus react again
+        bool any = false;
+        for (bool d : physDown) any |= d;
+        if (!any) remapJustDone = false;
+        return;
+    }
+    bool any = false;
+    for (bool d : physDown) any |= d;
+    if (!remapArmed) { if (!any) remapArmed = true; return; }
+    for (int i = 0; i < PH_COUNT; i++)
+        if (physDown[i]) {
+            mapping[i] = remapAction;
+            saveMapping();
+            trace("remap: %s -> %s", physNames[i], actionName(remapAction));
+            remapAction = ACT_NONE;
+            remapJustDone = true;
+            return;
+        }
 }
 
 // ---------------------------------------------------------------- library: playtime, favourites, covers
@@ -495,7 +612,8 @@ static const std::vector<uint32_t> *cover(const std::string &rom) {
 static const int MENU_W = 1024, MENU_H = 768, CELL_W = 16, CELL_H = 32;
 static const int COLS = MENU_W / CELL_W, ROWS = MENU_H / CELL_H;
 static std::vector<uint32_t> menuPixels(MENU_W * MENU_H);
-enum MenuMode { MENU_NONE, MENU_ROMS, MENU_PAUSE, MENU_HELP, MENU_ABOUT, MENU_ARRANGE, MENU_SLOTS };
+enum MenuMode { MENU_NONE, MENU_ROMS, MENU_PAUSE, MENU_HELP, MENU_ABOUT, MENU_ARRANGE, MENU_SLOTS, MENU_CONTROLS };
+static int controlsSel = 0;  // rows: actions, then scope, reset, done
 static int slotSel = 0;
 static bool slotSaving = true;
 static std::vector<std::string> aboutLines;
@@ -569,27 +687,11 @@ static void drawText(int col, int row, const std::string &s, uint32_t color, uin
 }
 static const uint32_t C_BG = 0xff201812, C_TEXT = 0xffe0e0e0, C_DIM = 0xff909090, C_HI = 0xff30c0ff, C_SELBG = 0xff604020;
 
-static const char *helpLines[] = {
-    "CONTROLS (Touch controllers)",
-    "",
-    "Move ............ either thumbstick",
-    "SNES B (jump) ... right A",
-    "SNES A .......... right B",
-    "SNES Y (run) .... right trigger",
-    "SNES X .......... left trigger",
-    "SNES L / R ...... left grip / right grip",
-    "Start ........... left menu button or right stick click",
-    "Select .......... left X",
-    "Rewind .......... hold the left stick in (gamepad: hold L2)",
-    "PopUp16 menu ..... left Y",
-    "",
-    "Bluetooth gamepads work too (menu: Select+Start, fast-forward: R2).",
-    "",
-    "Press any button to play."};
+
 enum PauseItem { P_RESUME, P_CONTROLS, P_SPEED, P_DEPTH, P_CONV, P_3D, P_MODE7, P_SWAP, P_ROOM, P_STYLE, P_LOOK, P_SKY,
                  P_ARRANGE, P_RESET, P_SIZE, P_DIST, P_SAVE, P_LOAD, P_GAMES, P_ABOUT, PAUSE_N };
 static const char *pauseItems[PAUSE_N] = {
-    "Resume", "Controls", "Game speed", "3D depth", "Convergence", "3D on/off", "Mode 7 floor depth", "Swap eyes",
+    "Resume", "Controls & remapping", "Game speed", "3D depth", "Convergence", "3D on/off", "Mode 7 floor depth", "Swap eyes",
     "Surroundings", "3D style", "Pop-up look", "Show sky", "Move & resize...", "Reset position",
     "Screen size", "Screen distance", "Save state", "Load state", "Choose game", "About & licenses"};
 static bool adjustable(int i) { return i == P_SPEED || i == P_DEPTH || i == P_CONV || i == P_SIZE || i == P_DIST; }
@@ -748,6 +850,31 @@ static void renderMenu() {
     else if (menuMode == MENU_SLOTS) {
         drawSlots();
     }
+    else if (menuMode == MENU_CONTROLS) {
+        drawText(1, 0, "Controls & remapping", C_HI);
+        int rows = N_ACTIONS + 3;
+        for (int r = 0; r < rows; r++) {
+            int y = r + 2 + (r >= N_ACTIONS ? 1 : 0);
+            bool sel = r == controlsSel;
+            if (sel) for (int x = 0; x < MENU_W; x++) for (int yy = 0; yy < CELL_H; yy++) menuPixels[(y * CELL_H + yy) * MENU_W + x] = C_SELBG;
+            uint32_t col = sel ? 0xffffffff : C_TEXT;
+            if (r < N_ACTIONS) {
+                int a = kActions[r];
+                drawText(2, y, actionName(a), col);
+                std::string v = (remapAction == a) ? "press a button...  (left Y cancels)" : boundTo(a);
+                drawText(24, y, v.substr(0, COLS - 25), remapAction == a ? C_HI : col);
+            } else if (r == N_ACTIONS) {
+                drawText(2, y, "Applies to", col);
+                drawText(24, y, controlsPerGame ? "< this game only >" : "< all games >", col);
+            } else if (r == N_ACTIONS + 1) {
+                drawText(2, y, "Reset to defaults", col);
+            } else {
+                drawText(2, y, "Done", col);
+            }
+        }
+        drawText(1, ROWS - 2, "A: assign a button   X: clear   menus always use A / B", C_DIM);
+        drawText(1, ROWS - 1, "Left Y opens the PopUp16 menu and cannot be reassigned.", C_DIM);
+    }
     else if (menuMode == MENU_ARRANGE) {
         static const char *lines[] = {"MOVE & RESIZE", "",
                                       "Hold a trigger and move your hand: the game follows,",
@@ -758,8 +885,9 @@ static void renderMenu() {
         for (int i = 0; i < 8; i++) drawText(1, i + 1, lines[i], i == 0 ? C_HI : C_TEXT);
     }
     else if (menuMode == MENU_HELP) {
-        for (int i = 0; i < (int)(sizeof(helpLines) / sizeof(helpLines[0])) && i < ROWS; i++)
-            drawText(1, i + 1, helpLines[i], i == 0 ? C_HI : C_TEXT);
+        std::vector<std::string> help = controlsHelp();
+        for (int i = 0; i < (int)help.size() && i < ROWS - 1; i++)
+            drawText(1, i + 1, help[i].substr(0, COLS - 2), i == 0 ? C_HI : C_TEXT);
     }
     if (!toast.empty() && nowSec() < toastUntil) drawText(1, ROWS - 2, toast, C_HI);
     menuDirty = false;
@@ -940,18 +1068,17 @@ static void pollActions() {
     float sx = fabsf(sl.x) > fabsf(sr.x) ? sl.x : sr.x, sy = fabsf(sl.y) > fabsf(sr.y) ? sl.y : sr.y;
     navX = sr.x; navY = sl.y;  // menu: left stick moves up/down, right stick changes values / pages
     trigRValue = getFloat(actTrigR);
-    memset(xrButtons, 0, sizeof xrButtons);
-    xrButtons[B_B] = getBool(actA);
-    xrButtons[B_A] = getBool(actB);
-    xrButtons[B_Y] = getFloat(actTrigR) > 0.5f;
-    xrButtons[B_X] = getFloat(actTrigL) > 0.5f;
-    xrButtons[B_L] = getFloat(actGripL) > 0.5f;
-    xrButtons[B_R] = getFloat(actGripR) > 0.5f;
-    xrButtons[B_SELECT] = getBool(actX);
-    xrRewind = getBool(actClickL);  // hold the left stick in to rewind
-    xrButtons[B_START] = getBool(actMenu) || getBool(actClickR);
-    xrButtons[B_UP] = sy > 0.5f; xrButtons[B_DOWN] = sy < -0.5f;
-    xrButtons[B_LEFT] = sx < -0.5f; xrButtons[B_RIGHT] = sx > 0.5f;
+    stickX = sx; stickY = sy;
+    physDown[PH_RA] = getBool(actA);
+    physDown[PH_RB] = getBool(actB);
+    physDown[PH_RTRIG] = getFloat(actTrigR) > 0.5f;
+    physDown[PH_RGRIP] = getFloat(actGripR) > 0.5f;
+    physDown[PH_RCLICK] = getBool(actClickR);
+    physDown[PH_LX] = getBool(actX);
+    physDown[PH_LTRIG] = getFloat(actTrigL) > 0.5f;
+    physDown[PH_LGRIP] = getFloat(actGripL) > 0.5f;
+    physDown[PH_LMENU] = getBool(actMenu);
+    physDown[PH_LCLICK] = getBool(actClickL);
     xrMenu = getBool(actY);
 }
 
@@ -1143,7 +1270,7 @@ static void menuInput(const bool *b) {
     navDir = d;
     bool up = fire && d == D_UP, down = fire && d == D_DOWN, left = fire && d == D_LEFT, right = fire && d == D_RIGHT;
     // buttons fire once per press; the trigger needs a firm pull and a full release
-    bool okBtn = b[B_B] || padButtons[B_Y];
+    bool okBtn = b[B_B];
     if (menuMode == MENU_ARRANGE) {  // triggers are busy grabbing; only A / B leave
         bool done = (okBtn && !okHeld) || (b[B_A] && !backHeld);
         okHeld = okBtn; backHeld = b[B_A];
@@ -1158,6 +1285,29 @@ static void menuInput(const bool *b) {
     backHeld = b[B_A];
     if (menuMode == MENU_HELP) {
         if (ok || back || fire) { menuMode = MENU_NONE; menuDirty = true; }
+        return;
+    }
+    if (menuMode == MENU_CONTROLS) {
+        int rows = N_ACTIONS + 3;
+        bool clear = b[B_SELECT] && !favHeld;  // left X
+        favHeld = b[B_SELECT];
+        if (up) controlsSel = (controlsSel + rows - 1) % rows;
+        if (down) controlsSel = (controlsSel + 1) % rows;
+        if (controlsSel < N_ACTIONS) {
+            int a = kActions[controlsSel];
+            if (ok) { remapAction = a; remapArmed = false; }
+            if (clear) { for (int i = 0; i < PH_COUNT; i++) if (mapping[i] == a) mapping[i] = ACT_NONE; saveMapping(); }
+        } else if (controlsSel == N_ACTIONS && (ok || left || right) && gameLoaded) {
+            // switching to "all games" drops this game's own file and goes back to the shared mapping
+            if (controlsPerGame) { remove(controlsPath(true).c_str()); controlsPerGame = false; loadMapping(controlsPath(false)); }
+            else { controlsPerGame = true; saveMapping(); }
+        } else if (controlsSel == N_ACTIONS + 1 && ok) {
+            memcpy(mapping, defaultMap, sizeof mapping); saveMapping(); showToast("Controls reset");
+        } else if (controlsSel == N_ACTIONS + 2 && ok) {
+            menuMode = MENU_PAUSE;
+        }
+        if (back) menuMode = MENU_PAUSE;
+        menuDirty |= up || down || left || right || ok || back || clear;
         return;
     }
     if (menuMode == MENU_SLOTS) {
@@ -1244,7 +1394,7 @@ static void menuInput(const bool *b) {
     if (ok && !toggle(pauseSel)) {
         switch (pauseSel) {
         case P_RESUME: menuMode = MENU_NONE; break;
-        case P_CONTROLS: menuMode = MENU_HELP; break;
+        case P_CONTROLS: menuMode = MENU_CONTROLS; controlsSel = 0; break;
         case P_ARRANGE: menuMode = MENU_ARRANGE; resetMenuInput(); break;
         case P_RESET: defaultPlacement(); saveGlobal(); showToast("Position reset"); break;
         case P_SAVE: menuMode = MENU_SLOTS; slotSaving = true; break;
@@ -1367,6 +1517,7 @@ void android_main(android_app *app) {
     coverDir = filesDir + "/covers";
     mkdir(coverDir.c_str(), 0775);
     loadStats();
+    loadMapping(filesDir + "/controls.cfg");
     scanRoms();
     for (auto &[n, g] : stats) if (g.lastPlayed) libTab = TAB_RECENT;
     buildLibView();
@@ -1409,10 +1560,8 @@ void android_main(android_app *app) {
             // debug: files/debug_headless keeps the game running with the headset off (for adb tests)
             static bool headless = access((filesDir + "/debug_headless").c_str(), F_OK) == 0;
             if (headless && gameLoaded && menuMode == MENU_NONE) {
-                bool in[B_COUNT];
-                for (int i = 0; i < B_COUNT; i++) in[i] = padButtons[i];
-                in[B_UP] |= padAxisY < -0.5f; in[B_DOWN] |= padAxisY > 0.5f;
-                in[B_LEFT] |= padAxisX < -0.5f; in[B_RIGHT] |= padAxisX > 0.5f;
+                bool in[B_COUNT], rw, ff;
+                gameButtons(in, rw, ff);
                 memcpy(joypad, in, sizeof joypad);
                 double t = nowSec();
                 int hr = 0;
@@ -1441,9 +1590,12 @@ void android_main(android_app *app) {
                     readFile(filesDir + "/menu_request", req);
                     remove((filesDir + "/menu_request").c_str());
                     MenuMode keep = menuMode;
+                    MenuMode show = MENU_ROMS;
                     if (!req.empty() && req[0] >= '0' && req[0] <= '2') libTab = req[0] - '0';
-                    if (req.size() > 2) romSel = atoi((const char *)req.data() + 2);
-                    menuMode = MENU_ROMS; buildLibView(); renderMenu();
+                    if (!req.empty() && req[0] == 'c') show = MENU_CONTROLS;
+                    if (!req.empty() && req[0] == 'h') show = MENU_HELP;
+                    if (req.size() > 2) { romSel = atoi((const char *)req.data() + 2); controlsSel = romSel; }
+                    menuMode = show; buildLibView(); renderMenu();
                     std::vector<uint8_t> rgb(MENU_W * MENU_H * 3);
                     for (int i = 0; i < MENU_W * MENU_H; i++) { uint32_t c = menuPixels[i]; rgb[i * 3] = c & 255; rgb[i * 3 + 1] = (c >> 8) & 255; rgb[i * 3 + 2] = (c >> 16) & 255; }
                     png::writeRGB(filesDir + "/menu.png", MENU_W, MENU_H, rgb.data());
@@ -1478,10 +1630,9 @@ void android_main(android_app *app) {
         xrBeginFrame(session, &fbi);
 
         pollActions();
-        bool all[B_COUNT];
-        for (int i = 0; i < B_COUNT; i++) all[i] = xrButtons[i] || padButtons[i];
-        all[B_UP] |= padAxisY < -0.5f; all[B_DOWN] |= padAxisY > 0.5f;
-        all[B_LEFT] |= padAxisX < -0.5f; all[B_RIGHT] |= padAxisX > 0.5f;
+        bool all[B_COUNT], nav[B_COUNT], wantRewind, wantFast;
+        gameButtons(all, wantRewind, wantFast);
+        menuButtons(nav);
         {
             static const char *names[B_COUNT] = {"B", "Y", "Select", "Start", "Up", "Down", "Left", "Right", "A", "X", "L", "R"};
             static bool last[B_COUNT];
@@ -1490,8 +1641,10 @@ void android_main(android_app *app) {
                 if (all[i] != last[i]) { trace("input SNES %s %s (menu mode %d, game %d)", names[i], all[i] ? "down" : "up", (int)menuMode, (int)gameLoaded); last[i] = all[i]; }
             if (xrMenu != lastMenu) { trace("input PopUp16-menu button %s", xrMenu ? "down" : "up"); lastMenu = xrMenu; }
         }
-        bool menuBtn = xrMenu || padMenu || (padButtons[B_SELECT] && padButtons[B_START]);
-        if (menuBtn && !prevMenuBtn) {
+        bool menuBtn = xrMenu || padMenu || (physDown[PH_PAD_SELECT] && physDown[PH_PAD_START]);
+        bool menuEdge = menuBtn && !prevMenuBtn;
+        if (menuEdge && remapAction >= 0) { remapAction = -1; menuDirty = true; menuEdge = false; }  // cancels a remap
+        if (menuEdge) {
             if (menuMode == MENU_NONE) { menuMode = MENU_PAUSE; pauseSel = 0; saveSram(); }
             else if (gameLoaded) { menuMode = MENU_NONE; saveGlobal(); saveSettings(saveDir + "/" + stem() + ".cfg", false); }
             menuDirty = true;
@@ -1502,7 +1655,8 @@ void android_main(android_app *app) {
         if (menuMode != MENU_NONE) {
             memset(joypad, 0, sizeof joypad);
             MenuMode before = menuMode;
-            menuInput(all);
+            if (remapAction >= 0 || remapJustDone) { int was = remapAction; remapCapture(); resetMenuInput(); if (was != remapAction) menuDirty = true; }
+            else menuInput(nav);
             if (before != MENU_NONE && menuMode == MENU_NONE) {
                 saveGlobal();
                 if (gameLoaded) saveSettings(saveDir + "/" + stem() + ".cfg", false);
@@ -1514,9 +1668,9 @@ void android_main(android_app *app) {
             // pace by audio: keep ~3 video frames of sound queued
             uint32_t target = (uint32_t)(OUT_RATE / avFps * 3);
             int runs = 0;
-            bool rewinding = xrRewind || padRewind;
+            bool rewinding = wantRewind;
             // game speed: the emulator follows the audio clock, so stretching the audio slows the game
-            float speed = std::clamp(cfg.speed * (padFast ? 2.0f : 1.0f), 0.25f, 4.0f);
+            float speed = std::clamp(cfg.speed * (wantFast ? 2.0f : 1.0f), 0.25f, 4.0f);
             resampleStep = avRate * speed / OUT_RATE;
             if (rewinding) {
                 double t = nowSec();

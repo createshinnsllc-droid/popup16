@@ -62,6 +62,9 @@ GoodTools-style `.7z` sets.
 | Rewind | hold the left stick in |
 | PopUp16 menu | left Y |
 
+Every button can be reassigned, for one game or for all games, under menu > Controls &
+remapping, including Rewind and Fast-forward. Menus always use A to select and B to go back.
+
 ## How it works
 
 `snes9x-stereo3d.patch` makes the Snes9x renderer record which layer drew each pixel
