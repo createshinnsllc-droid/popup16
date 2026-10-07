@@ -18,6 +18,7 @@
 #include "libretro.h"
 #include "../shared/stereo.h"
 #include "../shared/diorama.h"
+#include "../shared/rewind.h"
 
 // ---------- core binding ----------
 struct Core {
@@ -351,6 +352,30 @@ int main(int argc, char **argv) {
         const char *planePrefix = getenv("POPUP16_PLANES");
         auto enablePlanes = (void (*)(int))dlsym(core.h, "snes3d_enable_planes");
         if (planePrefix && enablePlanes) enablePlanes(1);
+        if (getenv("POPUP16_REWINDTEST")) {
+            // snapshot every 3 frames, then walk the whole history back and compare with the originals
+            Rewind rw;
+            std::vector<std::vector<uint8_t>> kept;
+            size_t sz = core.serialize_size(), raw = 0;
+            double t0 = SDL_GetPerformanceCounter();
+            for (int i = 0; i < n; i++) {
+                autoFrame = i; core.run();
+                if (i % 3 == 0) {
+                    std::vector<uint8_t> st(sz);
+                    core.serialize(st.data(), sz);
+                    rw.push(st); kept.push_back(st); raw += sz;
+                }
+            }
+            double ms = (SDL_GetPerformanceCounter() - t0) * 1000.0 / SDL_GetPerformanceFrequency();
+            size_t depth = rw.depth(), bytes = rw.bytes();
+            int bad = 0, steps = 0;
+            std::vector<uint8_t> back;
+            for (int k = (int)kept.size() - 2; k >= 0 && rw.pop(back); k--, steps++) bad += back != kept[k];
+            bool restored = core.unserialize(back.data(), back.size());
+            printf("rewind: %zu snapshots of %zu B, history %zu B (%.1f%% of raw), %d steps back, %d mismatches, restore %s, %.1f ms for %d frames\n",
+                   depth + 1, sz, bytes, 100.0 * bytes / std::max<size_t>(raw, 1), steps, bad, restored ? "ok" : "FAILED", ms, n);
+            return 0;
+        }
         for (int i = 0; i < n; i++) { if (scripted) autoFrame = i; core.run(); }
         if (!cur.valid) { fprintf(stderr, "no frame\n"); return 1; }
         buildSbs();

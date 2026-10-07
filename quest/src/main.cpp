@@ -37,6 +37,7 @@
 #include "../../shared/stereo.h"
 #include "font8x16.h"
 #include "renderer.h"
+#include "../../shared/rewind.h"
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "PopUp16", __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "PopUp16", __VA_ARGS__)
@@ -70,7 +71,7 @@ struct Settings {
     // per game
     float strength = 1.0f, convergence = 0.0f, mode7Ramp = 1, swapEyes = 0, stereoOn = 1;
     // global: how and where the diorama sits in the room
-    float screenWidth = 2.4f, distance = 2.2f, room = 0, box = 0, popLook = 1, sky = 1;
+    float screenWidth = 2.4f, distance = 2.2f, room = 0, box = 0, popLook = 1, sky = 1, speed = 1;
     float px = 0, py = 0, pz = -2.2f, qx = 0, qy = 0, qz = 0, qw = 1;
 };
 static Settings cfg;
@@ -80,7 +81,7 @@ static const struct { const char *name; float Settings::*field; bool global; } k
     {"mode7Ramp", &Settings::mode7Ramp, false}, {"swapEyes", &Settings::swapEyes, false},
     {"stereoOn", &Settings::stereoOn, false}, {"screenWidth", &Settings::screenWidth, true},
     {"distance", &Settings::distance, true}, {"room", &Settings::room, true}, {"box", &Settings::box, true},
-    {"popLook", &Settings::popLook, true}, {"sky", &Settings::sky, true},
+    {"popLook", &Settings::popLook, true}, {"sky", &Settings::sky, true}, {"speed", &Settings::speed, true},
     {"px", &Settings::px, true}, {"py", &Settings::py, true}, {"pz", &Settings::pz, true},
     {"qx", &Settings::qx, true}, {"qy", &Settings::qy, true}, {"qz", &Settings::qz, true}, {"qw", &Settings::qw, true},
 };
@@ -126,6 +127,7 @@ static std::atomic<uint32_t> ringW{0}, ringR{0};
 static double resampleStep = 32040.5 / OUT_RATE, resamplePos = 0.0;
 static int16_t prevL = 0, prevR = 0;
 static AAudioStream *aaStream = nullptr;
+static bool muteAudio = false;  // rewind plays back silently
 
 static uint32_t ringFill() { return ringW.load(std::memory_order_acquire) - ringR.load(std::memory_order_acquire); }
 static void pushOut(int16_t l, int16_t r) {
@@ -173,6 +175,7 @@ static void stopAudio() {
 enum { B_B, B_Y, B_SELECT, B_START, B_UP, B_DOWN, B_LEFT, B_RIGHT, B_A, B_X, B_L, B_R, B_COUNT };  // RETRO_DEVICE_ID_JOYPAD order
 static bool xrButtons[B_COUNT], padButtons[B_COUNT];
 static bool padMenu = false, xrMenu = false;
+static bool padRewind = false, padFast = false, xrRewind = false;
 static float navX = 0, navY = 0, trigRValue = 0;  // menu: right stick X, left stick Y, right trigger
 static float padAxisX = 0, padAxisY = 0;
 static bool joypad[B_COUNT];
@@ -183,8 +186,8 @@ static int keyToButton(int32_t key) {
     case AKEYCODE_BUTTON_B: return B_A;
     case AKEYCODE_BUTTON_X: return B_Y;
     case AKEYCODE_BUTTON_Y: return B_X;
-    case AKEYCODE_BUTTON_L1: case AKEYCODE_BUTTON_L2: return B_L;
-    case AKEYCODE_BUTTON_R1: case AKEYCODE_BUTTON_R2: return B_R;
+    case AKEYCODE_BUTTON_L1: return B_L;
+    case AKEYCODE_BUTTON_R1: return B_R;
     case AKEYCODE_BUTTON_START: return B_START;
     case AKEYCODE_BUTTON_SELECT: return B_SELECT;
     case AKEYCODE_DPAD_UP: return B_UP;
@@ -200,6 +203,8 @@ static int32_t onInput(android_app *, AInputEvent *e) {
         int32_t key = AKeyEvent_getKeyCode(e);
         bool down = AKeyEvent_getAction(e) == AKEY_EVENT_ACTION_DOWN;
         if (key == AKEYCODE_BUTTON_MODE || key == AKEYCODE_BUTTON_THUMBL) { padMenu = down; return 1; }
+        if (key == AKEYCODE_BUTTON_L2) { padRewind = down; return 1; }   // hold to rewind
+        if (key == AKEYCODE_BUTTON_R2) { padFast = down; return 1; }     // hold to fast-forward
         int b = keyToButton(key);
         trace("gamepad key %d %s", key, down ? "down" : "up");
         if (b >= 0) { padButtons[b] = down; return 1; }
@@ -256,12 +261,30 @@ static void video_cb(const void *data, unsigned w, unsigned h, size_t pitch) {
     }
     newFrame = true;
 }
-static void audio_sample(int16_t l, int16_t r) { pushIn(l, r); }
-static size_t audio_batch(const int16_t *d, size_t n) { for (size_t i = 0; i < n; i++) pushIn(d[i * 2], d[i * 2 + 1]); return n; }
+static void audio_sample(int16_t l, int16_t r) { if (!muteAudio) pushIn(l, r); }
+static size_t audio_batch(const int16_t *d, size_t n) { if (muteAudio) return n; for (size_t i = 0; i < n; i++) pushIn(d[i * 2], d[i * 2 + 1]); return n; }
 static void input_poll(void) {}
 static int16_t input_state(unsigned port, unsigned device, unsigned, unsigned id) {
     if (port != 0 || device != RETRO_DEVICE_JOYPAD || id >= B_COUNT) return 0;
     return joypad[id] ? 1 : 0;
+}
+
+static Rewind rewinder;
+static int framesSinceSnap = 0;
+static void runFrame() {  // one emulated frame, snapshotting every third for rewind
+    retro_run();
+    if (++framesSinceSnap >= 3) {
+        framesSinceSnap = 0;
+        static std::vector<uint8_t> st;
+        st.resize(retro_serialize_size());
+        if (!st.empty() && retro_serialize(st.data(), st.size())) rewinder.push(st);
+    }
+}
+static bool rewindStep() {  // one step back in history, shown by running one silent frame
+    static std::vector<uint8_t> st;
+    if (!rewinder.pop(st) || !retro_unserialize(st.data(), st.size())) return false;
+    muteAudio = true; retro_run(); muteAudio = false;
+    return true;
 }
 
 static std::string stem() { return gameName.substr(0, gameName.find_last_of('.')); }
@@ -310,6 +333,7 @@ static bool loadGame(const std::string &name) {
     retro_game_info gi = {path.c_str(), keep.data(), keep.size(), nullptr};
     if (!retro_load_game(&gi)) { LOGE("core refused %s", name.c_str()); retro_deinit(); return false; }
     snes3d_enable_planes(1);
+    rewinder.clear(); framesSinceSnap = 0;
     gameLoaded = true; gameName = name; gamePath = path;
     retro_system_av_info av; retro_get_system_av_info(&av);
     avFps = av.timing.fps; avRate = av.timing.sample_rate;
@@ -326,7 +350,9 @@ static bool loadGame(const std::string &name) {
 static const int MENU_W = 1024, MENU_H = 768, CELL_W = 16, CELL_H = 32;
 static const int COLS = MENU_W / CELL_W, ROWS = MENU_H / CELL_H;
 static std::vector<uint32_t> menuPixels(MENU_W * MENU_H);
-enum MenuMode { MENU_NONE, MENU_ROMS, MENU_PAUSE, MENU_HELP, MENU_ABOUT, MENU_ARRANGE };
+enum MenuMode { MENU_NONE, MENU_ROMS, MENU_PAUSE, MENU_HELP, MENU_ABOUT, MENU_ARRANGE, MENU_SLOTS };
+static int slotSel = 0;
+static bool slotSaving = true;
 static std::vector<std::string> aboutLines;
 static int aboutTop = 0;
 static MenuMode menuMode = MENU_ROMS;
@@ -376,22 +402,76 @@ static const char *helpLines[] = {
     "SNES X .......... left trigger",
     "SNES L / R ...... left grip / right grip",
     "Start ........... left menu button or right stick click",
-    "Select .......... left X or left stick click",
+    "Select .......... left X",
+    "Rewind .......... hold the left stick in (gamepad: hold L2)",
     "PopUp16 menu ..... left Y",
     "",
-    "Bluetooth gamepads work too (menu: Select+Start).",
+    "Bluetooth gamepads work too (menu: Select+Start, fast-forward: R2).",
     "",
     "Press any button to play."};
-enum PauseItem { P_RESUME, P_CONTROLS, P_DEPTH, P_CONV, P_3D, P_MODE7, P_SWAP, P_ROOM, P_STYLE, P_LOOK, P_SKY,
+enum PauseItem { P_RESUME, P_CONTROLS, P_SPEED, P_DEPTH, P_CONV, P_3D, P_MODE7, P_SWAP, P_ROOM, P_STYLE, P_LOOK, P_SKY,
                  P_ARRANGE, P_RESET, P_SIZE, P_DIST, P_SAVE, P_LOAD, P_GAMES, P_ABOUT, PAUSE_N };
 static const char *pauseItems[PAUSE_N] = {
-    "Resume", "Controls", "3D depth", "Convergence", "3D on/off", "Mode 7 floor depth", "Swap eyes",
+    "Resume", "Controls", "Game speed", "3D depth", "Convergence", "3D on/off", "Mode 7 floor depth", "Swap eyes",
     "Surroundings", "3D style", "Pop-up look", "Show sky", "Move & resize...", "Reset position",
     "Screen size", "Screen distance", "Save state", "Load state", "Choose game", "About & licenses"};
-static bool adjustable(int i) { return i == P_DEPTH || i == P_CONV || i == P_SIZE || i == P_DIST; }
+static bool adjustable(int i) { return i == P_SPEED || i == P_DEPTH || i == P_CONV || i == P_SIZE || i == P_DIST; }
 static bool toggle(int i) { return i == P_3D || i == P_MODE7 || i == P_SWAP || i == P_ROOM || i == P_STYLE || i == P_LOOK || i == P_SKY; }
 static void defaultPlacement() {
     cfg.px = 0; cfg.py = 0; cfg.pz = -cfg.distance; cfg.qx = cfg.qy = cfg.qz = 0; cfg.qw = 1;
+}
+
+static void showToast(const std::string &t);
+// ---- save slots: state + a thumbnail of the frame + the time it was made
+static std::string slotPath(int n) { return saveDir + "/" + stem() + (n == 0 ? ".state" : ".slot" + std::to_string(n + 1) + ".state"); }
+static void saveSlot(int n) {
+    std::vector<uint8_t> st(retro_serialize_size());
+    if (st.empty() || !retro_serialize(st.data(), st.size())) { showToast("Could not save"); return; }
+    writeFile(slotPath(n), st.data(), st.size());
+    if (frame.valid) {
+        std::vector<uint8_t> th(4 + frame.rgb565.size() * 2);
+        uint16_t wh[2] = {(uint16_t)frame.w, (uint16_t)frame.h};
+        memcpy(th.data(), wh, 4); memcpy(th.data() + 4, frame.rgb565.data(), frame.rgb565.size() * 2);
+        writeFile(slotPath(n) + ".thumb", th.data(), th.size());
+    }
+    showToast("Saved to slot " + std::to_string(n + 1));
+}
+static bool loadSlot(int n) {
+    std::vector<uint8_t> st;
+    return readFile(slotPath(n), st) && retro_unserialize(st.data(), st.size());
+}
+static void drawSlots() {
+    char buf[96];
+    drawText(1, 0, slotSaving ? "Save to which slot?" : "Load which slot?", C_HI);
+    for (int n = 0; n < 4; n++) {
+        int c = n % 2, r = n / 2, x0 = 16 + c * 504, y0 = 48 + r * 336, labelRow = r == 0 ? 10 : 21;
+        if (n == slotSel)  // highlight frame
+            for (int y = y0; y < y0 + 312; y++)
+                for (int x = x0; x < x0 + 496; x++)
+                    if (y < y0 + 4 || y >= y0 + 308 || x < x0 + 4 || x >= x0 + 492) menuPixels[y * MENU_W + x] = C_HI;
+        std::vector<uint8_t> th;
+        struct stat sb;
+        bool exists = stat(slotPath(n).c_str(), &sb) == 0;
+        if (exists && readFile(slotPath(n) + ".thumb", th) && th.size() > 4) {
+            uint16_t wh[2]; memcpy(wh, th.data(), 4);
+            const uint16_t *px = (const uint16_t *)(th.data() + 4);
+            if (th.size() >= 4 + (size_t)wh[0] * wh[1] * 2) {
+                const int tw = 292, tht = 256, tx = x0 + 102, ty = y0 + 28;
+                for (int y = 0; y < tht; y++)
+                    for (int x = 0; x < tw; x++) {
+                        uint16_t c565 = px[(y * wh[1] / tht) * wh[0] + x * wh[0] / tw];
+                        uint32_t rr = ((c565 >> 11) & 31) * 255 / 31, gg = ((c565 >> 5) & 63) * 255 / 63, bb = (c565 & 31) * 255 / 31;
+                        menuPixels[(ty + y) * MENU_W + tx + x] = 0xff000000u | (bb << 16) | (gg << 8) | rr;
+                    }
+            }
+        }
+        if (exists) {
+            char ts[32]; strftime(ts, sizeof ts, "%b %d %H:%M", localtime(&sb.st_mtime));
+            snprintf(buf, sizeof buf, "Slot %d  %s", n + 1, ts);
+        } else snprintf(buf, sizeof buf, "Slot %d  (empty)", n + 1);
+        drawText(x0 / CELL_W + 6, labelRow, buf, n == slotSel ? 0xffffffff : C_TEXT);
+    }
+    drawText(1, ROWS - 1, "sticks: choose slot   A: confirm   B: back", C_DIM);
 }
 
 static void renderMenu() {
@@ -423,6 +503,7 @@ static void renderMenu() {
         for (int i = 0; i < PAUSE_N; i++) {
             std::string v;
             switch (i) {
+            case P_SPEED: snprintf(buf, sizeof buf, "%.2gx%s", cfg.speed, cfg.speed < 1 ? " slow-mo" : cfg.speed > 1 ? " fast" : ""); v = buf; break;
             case P_DEPTH: snprintf(buf, sizeof buf, "%.2f", cfg.strength); v = buf; break;
             case P_CONV: snprintf(buf, sizeof buf, "%+.1f", cfg.convergence); v = buf; break;
             case P_3D: v = on(cfg.stereoOn) ? "on" : "off"; break;
@@ -448,6 +529,9 @@ static void renderMenu() {
             drawText(1, i, aboutLines[aboutTop + i], aboutTop + i < 4 ? C_HI : C_TEXT);
         snprintf(buf, sizeof buf, "line %d/%d   L stick: scroll  R stick: page  B: back", aboutTop + 1, (int)aboutLines.size());
         drawText(1, ROWS - 1, buf, C_DIM);
+    }
+    else if (menuMode == MENU_SLOTS) {
+        drawSlots();
     }
     else if (menuMode == MENU_ARRANGE) {
         static const char *lines[] = {"MOVE & RESIZE", "",
@@ -648,7 +732,8 @@ static void pollActions() {
     xrButtons[B_X] = getFloat(actTrigL) > 0.5f;
     xrButtons[B_L] = getFloat(actGripL) > 0.5f;
     xrButtons[B_R] = getFloat(actGripR) > 0.5f;
-    xrButtons[B_SELECT] = getBool(actX) || getBool(actClickL);
+    xrButtons[B_SELECT] = getBool(actX);
+    xrRewind = getBool(actClickL);  // hold the left stick in to rewind
     xrButtons[B_START] = getBool(actMenu) || getBool(actClickR);
     xrButtons[B_UP] = sy > 0.5f; xrButtons[B_DOWN] = sy < -0.5f;
     xrButtons[B_LEFT] = sx < -0.5f; xrButtons[B_RIGHT] = sx > 0.5f;
@@ -832,7 +917,6 @@ static Dir readDir(const bool *b, float x, float y) {
 }
 static void resetMenuInput() { navDir = D_NONE; okHeld = backHeld = trigHeld = true; }
 
-static void savePause(const char *msg) { showToast(msg); }
 
 static void menuInput(const bool *b) {
     // the stick reads "up" as +y; gamepad axes read "up" as -y (already folded into b[] as digital)
@@ -859,6 +943,18 @@ static void menuInput(const bool *b) {
     backHeld = b[B_A];
     if (menuMode == MENU_HELP) {
         if (ok || back || fire) { menuMode = MENU_NONE; menuDirty = true; }
+        return;
+    }
+    if (menuMode == MENU_SLOTS) {
+        if (up || down) slotSel ^= 2;
+        if (left || right) slotSel ^= 1;
+        if (back) menuMode = MENU_PAUSE;
+        if (ok) {
+            if (slotSaving) saveSlot(slotSel);
+            else if (loadSlot(slotSel)) { menuMode = MENU_NONE; rewinder.clear(); }
+            else showToast("Slot " + std::to_string(slotSel + 1) + " is empty");
+        }
+        menuDirty |= up || down || left || right || back || ok;
         return;
     }
     if (menuMode == MENU_ABOUT) {
@@ -894,6 +990,13 @@ static void menuInput(const bool *b) {
     if (delta || (ok && toggle(pauseSel))) {
         changed = true;
         switch (pauseSel) {
+        case P_SPEED: {
+            static const float speeds[] = {0.5f, 0.75f, 1.0f, 1.5f, 2.0f};
+            int k = 2;
+            for (int j = 0; j < 5; j++) if (fabsf(speeds[j] - cfg.speed) < 0.01f) k = j;
+            cfg.speed = speeds[std::clamp(k + delta, 0, 4)];
+            break;
+        }
         case P_DEPTH: cfg.strength = std::clamp(cfg.strength + 0.25f * delta, 0.0f, 3.0f); break;
         case P_CONV: cfg.convergence += 0.5f * delta; break;
         case P_3D: flip(cfg.stereoOn); break;
@@ -921,16 +1024,8 @@ static void menuInput(const bool *b) {
         case P_CONTROLS: menuMode = MENU_HELP; break;
         case P_ARRANGE: menuMode = MENU_ARRANGE; resetMenuInput(); break;
         case P_RESET: defaultPlacement(); saveGlobal(); showToast("Position reset"); break;
-        case P_SAVE: {
-            std::vector<uint8_t> st(retro_serialize_size());
-            if (retro_serialize(st.data(), st.size())) { writeFile(saveDir + "/" + stem() + ".state", st.data(), st.size()); savePause("State saved"); }
-            break;
-        }
-        case P_LOAD: {
-            std::vector<uint8_t> st;
-            savePause(readFile(saveDir + "/" + stem() + ".state", st) && retro_unserialize(st.data(), st.size()) ? "State loaded" : "No saved state");
-            break;
-        }
+        case P_SAVE: menuMode = MENU_SLOTS; slotSaving = true; break;
+        case P_LOAD: menuMode = MENU_SLOTS; slotSaving = false; break;
         case P_GAMES: scanRoms(); menuMode = MENU_ROMS; break;
         case P_ABOUT: menuMode = MENU_ABOUT; aboutTop = 0; break;
         }
@@ -1091,7 +1186,18 @@ void android_main(android_app *app) {
                 in[B_LEFT] |= padAxisX < -0.5f; in[B_RIGHT] |= padAxisX > 0.5f;
                 memcpy(joypad, in, sizeof joypad);
                 double t = nowSec();
-                while (t - lastEmu >= 1.0 / avFps) { retro_run(); lastEmu += 1.0 / avFps; if (t - lastEmu > 0.5) lastEmu = t; }
+                int hr = 0;
+                double t0 = nowSec();
+                while (t - lastEmu >= 1.0 / avFps) { runFrame(); hr++; lastEmu += 1.0 / avFps; if (t - lastEmu > 0.5) lastEmu = t; }
+                static double frameMs = 0; static int frameN = 0;
+                if (hr) { frameMs += (nowSec() - t0) * 1000.0 / hr; frameN++; }
+                if (frameN == 600) { trace("headless: %.2f ms per frame incl. rewind snapshots, history %zu steps / %zu KB", frameMs / frameN, rewinder.depth(), rewinder.bytes() / 1024); frameMs = 0; frameN = 0; }
+                if (access((filesDir + "/rewind_request").c_str(), F_OK) == 0) {  // debug: step back 300 snapshots (15 s)
+                    remove((filesDir + "/rewind_request").c_str());
+                    int n = 0; double r0 = nowSec();
+                    while (n < 300 && rewindStep()) n++;
+                    trace("headless: rewound %d steps in %.1f ms", n, (nowSec() - r0) * 1000.0);
+                }
                 periodicResumeSave();
                 usleep(2000);
                 if (access((filesDir + "/dump_request").c_str(), F_OK) == 0 && frame.valid) {
@@ -1150,8 +1256,16 @@ void android_main(android_app *app) {
             // pace by audio: keep ~3 video frames of sound queued
             uint32_t target = (uint32_t)(OUT_RATE / avFps * 3);
             int runs = 0;
-            if (aaStream) { while (ringFill() < target && runs < 4) { retro_run(); runs++; } }
-            else { double t = nowSec(); while (t - lastEmu >= 1.0 / avFps && runs < 4) { retro_run(); runs++; lastEmu += 1.0 / avFps; } }
+            bool rewinding = xrRewind || padRewind;
+            // game speed: the emulator follows the audio clock, so stretching the audio slows the game
+            float speed = std::clamp(cfg.speed * (padFast ? 2.0f : 1.0f), 0.25f, 4.0f);
+            resampleStep = avRate * speed / OUT_RATE;
+            if (rewinding) {
+                double t = nowSec();
+                if (t - lastEmu > 0.25) lastEmu = t;
+                while (t - lastEmu >= 1.0 / avFps && runs < 2) { rewindStep(); runs++; lastEmu += 1.0 / avFps; }
+            } else if (aaStream) { while (ringFill() < target && runs < 4) { runFrame(); runs++; } lastEmu = nowSec(); }
+            else { double t = nowSec(); while (t - lastEmu >= 1.0 / (avFps * speed) && runs < 4) { runFrame(); runs++; lastEmu += 1.0 / (avFps * speed); } }
             statRuns += runs;
             periodicResumeSave();
         }

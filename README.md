@@ -14,7 +14,9 @@ own depth, like a pop-up book. Move your head and the scene has real parallax.
   original frame (tested pixel for pixel).
 - **Mode 7 floors** slope away to the horizon; skylines sit beyond it.
 - **Comfort limits** scaled to your eye spacing, so your eyes never have to diverge.
-- 60 fps emulation on a 120 Hz display; quick resume where you left off; save states.
+- 60 fps emulation on a 120 Hz display; quick resume where you left off.
+- Rewind (hold the left stick in), slow motion and fast speeds, four save slots with pictures.
+- Mixed reality: place the game in your room, carry it, resize it, peek into the pop-up box.
 - Touch controllers or a Bluetooth gamepad; in-headset game list, settings and
   controls card.
 - Mac version (SDL2) with side-by-side output for Virtual Desktop's 3D mode.
@@ -50,7 +52,8 @@ GoodTools-style `.7z` sets.
 | Y / X | right trigger / left trigger |
 | L / R | left grip / right grip |
 | Start | left menu button or right stick click |
-| Select | left X or left stick click |
+| Select | left X |
+| Rewind | hold the left stick in |
 | PopUp16 menu | left Y |
 
 ## How it works
