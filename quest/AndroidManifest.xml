@@ -15,7 +15,7 @@
     <intent><action android:name="org.khronos.openxr.OpenXRRuntimeService" /></intent>
     <intent><action android:name="org.khronos.openxr.OpenXRApiLayerService" /></intent>
   </queries>
-  <application android:label="SNES3D" android:hasCode="false" android:allowBackup="false" android:extractNativeLibs="true">
+  <application android:label="SNES3D" android:icon="@mipmap/ic_launcher" android:hasCode="false" android:allowBackup="false" android:extractNativeLibs="true">
     <meta-data android:name="com.oculus.supportedDevices" android:value="quest3|quest3s|questpro|quest2" />
     <meta-data android:name="com.oculus.intent.category.VR" android:value="vr_only" />
     <activity android:name="android.app.NativeActivity"

@@ -8,3 +8,5 @@ quest/third_party/oxr/
 *.sfc
 *.smc
 .DS_Store
+# generated from license files by tools/make_notices.py during the APK build
+quest/assets/NOTICES.txt

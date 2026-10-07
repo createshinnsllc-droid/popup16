@@ -12,7 +12,11 @@ cmake --build build/cmake
 rm -rf build/apk && mkdir -p build/apk/lib/arm64-v8a
 cp build/cmake/libsnes3dquest.so third_party/oxr/prefab/modules/openxr_loader/libs/android.arm64-v8a/libopenxr_loader.so build/apk/lib/arm64-v8a/
 $NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-strip build/apk/lib/arm64-v8a/libsnes3dquest.so
-$BT/aapt2 link -o build/unsigned.apk --manifest AndroidManifest.xml -I $SDK/platforms/android-32/android.jar
+(cd .. && python3 tools/make_notices.py >/dev/null)   # refresh assets/NOTICES.txt
+rm -rf build/res && mkdir -p build/res
+$BT/aapt2 compile --dir res -o build/res/res.zip
+$BT/aapt2 link -o build/unsigned.apk --manifest AndroidManifest.xml -I $SDK/platforms/android-32/android.jar \
+  -R build/res/res.zip -A assets --auto-add-overlay
 (cd build/apk && zip -qr ../unsigned.apk lib)
 $BT/zipalign -f -p 4 build/unsigned.apk build/aligned.apk
 KS=$HOME/.android/debug.keystore

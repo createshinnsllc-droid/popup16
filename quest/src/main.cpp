@@ -5,6 +5,7 @@
 
 #include <android/log.h>
 #include <android/input.h>
+#include <android/asset_manager.h>
 #include <android/keycodes.h>
 #include <android_native_app_glue.h>
 #include <aaudio/AAudio.h>
@@ -264,8 +265,22 @@ static void saveSram() {
     size_t n = retro_get_memory_size(RETRO_MEMORY_SAVE_RAM);
     if (n) writeFile(saveDir + "/" + stem() + ".srm", retro_get_memory_data(RETRO_MEMORY_SAVE_RAM), n);
 }
+// quick resume: the running game's state and name are saved whenever the app may go away
+static void saveResume() {
+    if (!gameLoaded) return;
+    std::vector<uint8_t> s(retro_serialize_size());
+    if (!s.empty() && retro_serialize(s.data(), s.size())) {
+        writeFile(saveDir + "/" + stem() + ".resume", s.data(), s.size());
+        writeFile(filesDir + "/last_game.txt", gameName.data(), gameName.size());
+    }
+}
+static void periodicResumeSave() {  // crash safety while playing
+    static double next = nowSec() + 60;
+    if (nowSec() > next) { saveResume(); next = nowSec() + 60; }
+}
 static void unloadGame() {
     if (!gameLoaded) return;
+    saveResume();
     saveSram();
     saveSettings(saveDir + "/" + stem() + ".cfg");
     retro_unload_game();
@@ -308,7 +323,9 @@ static bool loadGame(const std::string &name) {
 static const int MENU_W = 1024, MENU_H = 640, CELL_W = 16, CELL_H = 32;
 static const int COLS = MENU_W / CELL_W, ROWS = MENU_H / CELL_H;
 static std::vector<uint32_t> menuPixels(MENU_W * MENU_H);
-enum MenuMode { MENU_NONE, MENU_ROMS, MENU_PAUSE, MENU_HELP };
+enum MenuMode { MENU_NONE, MENU_ROMS, MENU_PAUSE, MENU_HELP, MENU_ABOUT };
+static std::vector<std::string> aboutLines;
+static int aboutTop = 0;
 static MenuMode menuMode = MENU_ROMS;
 static std::vector<std::string> roms;
 static int romSel = 0, pauseSel = 0;
@@ -363,7 +380,7 @@ static const char *helpLines[] = {
     "",
     "Press any button to play."};
 static const char *pauseItems[] = {"Resume", "Controls", "3D depth", "Convergence", "3D on/off", "Mode 7 floor depth", "Swap eyes",
-                                   "Screen size", "Screen distance", "Save state", "Load state", "Choose game"};
+                                   "Screen size", "Screen distance", "Save state", "Load state", "Choose game", "About & licenses"};
 static const int PAUSE_N = sizeof(pauseItems) / sizeof(pauseItems[0]);
 
 static void renderMenu() {
@@ -409,6 +426,12 @@ static void renderMenu() {
             if (!v.empty()) drawText(26, i + 2, (i >= 2 && i <= 8 ? "< " : "") + v + (i >= 2 && i <= 8 ? " >" : ""), sel ? 0xffffffff : C_TEXT);
         }
         drawText(1, ROWS - 1, "L stick: move  R stick: change  A: select  B: resume", C_DIM);
+    }
+    else if (menuMode == MENU_ABOUT) {
+        for (int i = 0; i < ROWS - 1 && aboutTop + i < (int)aboutLines.size(); i++)
+            drawText(1, i, aboutLines[aboutTop + i], aboutTop + i < 4 ? C_HI : C_TEXT);
+        snprintf(buf, sizeof buf, "line %d/%d   L stick: scroll  R stick: page  B: back", aboutTop + 1, (int)aboutLines.size());
+        drawText(1, ROWS - 1, buf, C_DIM);
     }
     else if (menuMode == MENU_HELP) {
         for (int i = 0; i < (int)(sizeof(helpLines) / sizeof(helpLines[0])) && i < ROWS; i++)
@@ -695,7 +718,7 @@ static void handleXrEvents(android_app *app) {
                 bi.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
                 if (XR_SUCCEEDED(xrBeginSession(session, &bi))) { sessionRunning = true; requestRefreshRate(); }
             } else if (sessionState == XR_SESSION_STATE_STOPPING) {
-                xrEndSession(session); sessionRunning = false; saveSram();
+                xrEndSession(session); sessionRunning = false; saveSram(); saveResume();
             } else if (sessionState == XR_SESSION_STATE_EXITING || sessionState == XR_SESSION_STATE_LOSS_PENDING) {
                 ANativeActivity_finish(app->activity);
             }
@@ -751,6 +774,16 @@ static void menuInput(const bool *b) {
         if (ok || back || fire) { menuMode = MENU_NONE; menuDirty = true; }
         return;
     }
+    if (menuMode == MENU_ABOUT) {
+        int page = ROWS - 2, last = std::max(0, (int)aboutLines.size() - page);
+        if (up) aboutTop = std::max(0, aboutTop - 1);
+        if (down) aboutTop = std::min(last, aboutTop + 1);
+        if (left) aboutTop = std::max(0, aboutTop - page);
+        if (right) aboutTop = std::min(last, aboutTop + page);
+        if (back || ok) menuMode = MENU_PAUSE;
+        menuDirty |= up || down || left || right || back || ok;
+        return;
+    }
     if (menuMode == MENU_ROMS) {
         if (roms.empty()) { if (ok) scanRoms(); menuDirty |= ok; return; }
         int page = ROWS - 3;
@@ -800,6 +833,7 @@ static void menuInput(const bool *b) {
             break;
         }
         case 11: scanRoms(); menuMode = MENU_ROMS; break;
+        case 12: menuMode = MENU_ABOUT; aboutTop = 0; break;
         }
     }
     if (back) menuMode = MENU_NONE;
@@ -818,6 +852,28 @@ void android_main(android_app *app) {
     loadSettings(filesDir + "/settings.cfg");
     traceFile = fopen((filesDir + "/input.log").c_str(), "a");
     trace("---- start, ROM folder %s", romDir.c_str());
+    {
+        aboutLines = {"SNES3D 0.1 (working title) - layered 3D for SNES games on Quest",
+                      "Made by TyDroElite / CreateShinns LLC. Free, non-commercial software.",
+                      "Emulation by the Snes9x team. No games included.", "", ""};
+        if (AAsset *as = AAssetManager_open(app->activity->assetManager, "NOTICES.txt", AASSET_MODE_BUFFER)) {
+            std::string text((const char *)AAsset_getBuffer(as), AAsset_getLength(as));
+            AAsset_close(as);
+            size_t pos = 0;
+            const size_t width = COLS - 2;
+            while (pos <= text.size()) {
+                size_t nl = text.find('\n', pos);
+                std::string line = text.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+                for (auto &c : line) if (c == '\t') c = ' ';
+                do { aboutLines.push_back(line.substr(0, width)); line = line.size() > width ? line.substr(width) : ""; } while (!line.empty());
+                if (nl == std::string::npos) break;
+                pos = nl + 1;
+            }
+        } else {
+            aboutLines.push_back("(license file missing from this build)");
+        }
+        trace("about page: %d lines", (int)aboutLines.size());
+    }
     scanRoms();
 
     if (!initXR(app)) { LOGE("OpenXR init failed"); ANativeActivity_finish(app->activity); }
@@ -829,6 +885,15 @@ void android_main(android_app *app) {
             while (!n.empty() && (n.back() == '\n' || n.back() == '\r')) n.pop_back();
             remove((filesDir + "/autostart.txt").c_str());
             if (loadGame(n)) menuMode = MENU_NONE;
+        } else if (readFile(filesDir + "/last_game.txt", a)) {
+            // quick resume: reopen the last game exactly where it was left
+            std::string n(a.begin(), a.end());
+            std::vector<uint8_t> st;
+            if (loadGame(n)) {
+                if (readFile(saveDir + "/" + stem() + ".resume", st)) retro_unserialize(st.data(), st.size());
+                menuMode = MENU_NONE;
+                trace("resumed %s", n.c_str());
+            }
         }
     }
     int statRuns = 0, statFrames = 0;
@@ -855,6 +920,7 @@ void android_main(android_app *app) {
                 memcpy(joypad, in, sizeof joypad);
                 double t = nowSec();
                 while (t - lastEmu >= 1.0 / avFps) { retro_run(); lastEmu += 1.0 / avFps; if (t - lastEmu > 0.5) lastEmu = t; }
+                periodicResumeSave();
                 usleep(2000);
                 if (access((filesDir + "/dump_request").c_str(), F_OK) == 0 && frame.valid) {
                     remove((filesDir + "/dump_request").c_str());
@@ -915,6 +981,7 @@ void android_main(android_app *app) {
             if (aaStream) { while (ringFill() < target && runs < 4) { retro_run(); runs++; } }
             else { double t = nowSec(); while (t - lastEmu >= 1.0 / avFps && runs < 4) { retro_run(); runs++; lastEmu += 1.0 / avFps; } }
             statRuns += runs;
+            periodicResumeSave();
         }
 
         // eye poses in the room (LOCAL space); their separation drives the comfort clamp
