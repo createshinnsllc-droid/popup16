@@ -400,6 +400,7 @@ int main(int argc, char **argv) {
                 din.planeColor[n] = pcol[n].data(); din.planeZ[n] = pzz[n].data();
             }
             static diorama::Builder db;
+            db.look.on = false;  // the exactness check runs on the plain sheets
             db.build(din);
             std::vector<uint32_t> out(w * h, 0);
             for (const auto &q : db.quads)
@@ -411,6 +412,27 @@ int main(int argc, char **argv) {
             for (size_t i = 0; i < out.size(); i++) bad += out[i] != (db.lut[cur.rgb565[i]] & 0xffffff);
             int sheets = 0; { std::vector<int> seen; for (auto &q : db.quads) { int k = (int)q.slice * 256 + (int)q.z; if (std::find(seen.begin(), seen.end(), k) == seen.end()) seen.push_back(k); } sheets = (int)seen.size(); }
             printf("diorama: %zu quads, %d sheets, head-on mismatch %d of %zu px\n", db.quads.size(), sheets, bad, out.size());
+            {   // the same view with the pop-up look baked in, written next to the planes
+                db.look.on = true;
+                db.build(din);
+                std::vector<uint32_t> lk(w * h, 0);
+                for (const auto &q : db.quads)
+                    for (int x = (int)q.u0; x < (int)q.u1; x++) {
+                        uint32_t t = db.slice((int)q.slice)[(int)q.v * diorama::TEX_W + x];
+                        if ((t >> 24) == (uint32_t)q.z) lk[(int)q.v * w + x] = t;
+                    }
+                std::vector<uint8_t> pb(54 + (size_t)rb * h, 0);
+                auto p32 = [&](int o, uint32_t v) { memcpy(&pb[o], &v, 4); };
+                pb[0] = 'B'; pb[1] = 'M'; p32(2, (uint32_t)pb.size()); p32(10, 54); p32(14, 40);
+                p32(18, w); p32(22, h); pb[26] = 1; pb[28] = 24; p32(34, (uint32_t)(rb * h));
+                for (unsigned y = 0; y < h; y++)
+                    for (unsigned x = 0; x < w; x++) {
+                        uint32_t v = lk[y * w + x];
+                        uint8_t *px = &pb[54 + (size_t)(h - 1 - y) * rb + x * 3];
+                        px[0] = (v >> 16) & 255; px[1] = (v >> 8) & 255; px[2] = v & 255;  // RGBA bytes -> BGR
+                    }
+                writeFile(std::string(planePrefix) + "look.bmp", pb.data(), pb.size());
+            }
             if (getenv("POPUP16_SHEETS"))
                 for (auto &q : db.quads) if (q.v == (float)(h / 2)) printf("  row %d slice %d z %d disparity %+.2f span %d-%d\n", (int)q.v, (int)q.slice, (int)q.z, q.disparity, (int)q.u0, (int)q.u1);
         }

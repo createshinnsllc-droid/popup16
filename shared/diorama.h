@@ -41,10 +41,21 @@ inline float disparityFor(int p, bool mode01) {
     return mode01 ? m01[p] : m27[p];
 }
 
+// "Pop-up look": what a lit paper diorama would show. Baked into the sheet textures on the CPU,
+// so the headset GPU only samples them.
+struct Look {
+    bool on = true;
+    float shadow = 0.45f;     // darkening where a nearer sheet blocks the top-left light
+    float rim = 0.16f;        // cut-paper edge: lit top-left edge, shaded bottom-right edge
+    float haze = 0.022f;      // per SNES pixel of depth, toward a cool distance tint (max 0.22)
+};
+
 struct Builder {
     std::vector<uint32_t> tex;   // SLICES x TEX_H x TEX_W, RGBA bytes (R in the low byte)
     std::vector<Quad> quads;
     bool mode7Ramp = true;
+    bool showBackdrop = true;   // false: no backdrop sheet, so the room shows through behind the game
+    Look look;
     uint32_t lut[65536];
 
     Builder() : tex((size_t)SLICES * TEX_H * TEX_W, 0) {
@@ -130,13 +141,71 @@ struct Builder {
                 }
             }
         }
-        for (unsigned y = 0; y < h; y++) quads.push_back({0.0f, (float)w, (float)y, rowDisparity(5, 1, y), 5.0f, 1.0f});
+        if (showBackdrop)
+            for (unsigned y = 0; y < h; y++) quads.push_back({0.0f, (float)w, (float)y, rowDisparity(5, 1, y), 5.0f, 1.0f});
+
+        if (look.on) bakeLook(w, h);
 
         // far to near; equal depth keeps SNES priority order (higher z drawn later)
         std::stable_sort(quads.begin(), quads.end(), [](const Quad &a, const Quad &b) {
             if (a.disparity != b.disparity) return a.disparity > b.disparity;
             return a.z < b.z;
         });
+    }
+
+    // per-pixel disparity of every sheet pixel, and the nearest disparity at each screen position
+    std::vector<float> own, nearest;
+
+    void bakeLook(unsigned w, unsigned h) {
+        const size_t plane = (size_t)TEX_H * TEX_W;
+        own.assign((size_t)SLICES * plane, 1e9f);
+        nearest.assign((size_t)w * h, 1e9f);
+        for (const auto &q : quads) {
+            int s = (int)q.slice, y = (int)q.v;
+            uint32_t *row = slice(s) + (size_t)y * TEX_W;
+            for (int x = (int)q.u0; x < (int)q.u1; x++)
+                if ((row[x] >> 24) == (uint32_t)q.z) {
+                    own[(size_t)s * plane + (size_t)y * TEX_W + x] = q.disparity;
+                    float &n = nearest[(size_t)y * w + x];
+                    if (q.disparity < n) n = q.disparity;
+                }
+        }
+        auto nearAt = [&](int x, int y) {
+            if (x < 0 || y < 0 || x >= (int)w || y >= (int)h) return 1e9f;
+            return nearest[(size_t)y * w + x];
+        };
+        for (int s = 0; s < SLICES; s++) {
+            uint32_t *t = slice(s);
+            const float *od = &own[(size_t)s * plane];
+            for (int y = 0; y < (int)h; y++)
+                for (int x = 0; x < (int)w; x++) {
+                    size_t i = (size_t)y * TEX_W + x;
+                    float d = od[i];
+                    if (d > 1e8f) continue;
+                    uint32_t c = t[i], z = c >> 24;
+                    float r = (float)(c & 255), g = (float)((c >> 8) & 255), b = (float)((c >> 16) & 255);
+                    float k = 1.0f;
+                    // drop shadow: a nearer sheet up-left of here blocks the light (two taps = soft edge)
+                    float gap1 = d - nearAt(x - 2, y - 2), gap2 = d - nearAt(x - 4, y - 4);
+                    float sh = 0.5f * (std::clamp(gap1 / 1.5f, 0.0f, 1.0f) + std::clamp(gap2 / 1.5f, 0.0f, 1.0f));
+                    k -= look.shadow * sh;
+                    // cut-paper edge on everything except the backdrop
+                    if (s != 5) {
+                        auto same = [&](int xx, int yy) {
+                            if (xx < 0 || yy < 0 || xx >= (int)w || yy >= (int)h) return true;
+                            return (t[(size_t)yy * TEX_W + xx] >> 24) == z;
+                        };
+                        if (!same(x - 1, y) || !same(x, y - 1)) k += look.rim;
+                        else if (!same(x + 1, y) || !same(x, y + 1)) k -= look.rim;
+                    }
+                    r *= k; g *= k; b *= k;
+                    // distance haze toward a cool tint
+                    float hz = std::clamp(d * look.haze, 0.0f, 0.22f);
+                    r += (150.0f - r) * hz; g += (170.0f - g) * hz; b += (200.0f - b) * hz;
+                    auto cl = [](float v) { return (uint32_t)std::clamp(v, 0.0f, 255.0f); };
+                    t[i] = cl(r) | (cl(g) << 8) | (cl(b) << 16) | (z << 24);
+                }
+        }
     }
 };
 

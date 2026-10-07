@@ -1,6 +1,8 @@
 // Diorama renderer: draws the SNES layer sheets (shared/diorama.h) as real geometry into the two
-// eye images of an OpenXR projection layer. Each sheet sits at the distance its disparity implies
-// and is scaled so it covers the virtual screen exactly when seen from the starting head position.
+// eye images of an OpenXR projection layer. The whole diorama has a placement (uModel) in the room.
+// Screen style: each sheet sits at the distance its disparity implies and is scaled so it covers the
+// screen exactly from the seat in front of it. Box style: same-size sheets stacked behind a front
+// plane, like a paper diorama you can walk around.
 #pragma once
 #include <GLES3/gl3.h>
 #include <openxr/openxr.h>
@@ -18,6 +20,8 @@ uniform mat4 uViewProj;
 uniform vec4 uScreen;                   // width m, height m, distance m, metres per SNES pixel
 uniform vec4 uDepth;                    // ipd m, disparity scale, disparity offset, unused
 uniform vec2 uFrame;                    // frame width, height in texels
+uniform mat4 uModel;                    // placement: screen centre and orientation in the room
+uniform vec2 uStyle;                    // x: 0 screen, 1 box; y: box depth in metres per SNES pixel
 out vec2 vTex;
 flat out vec2 vSheet;
 void main() {
@@ -25,8 +29,10 @@ void main() {
     float ipd = uDepth.x;
     float s = clamp(d * uScreen.w, -2.0 * ipd, 0.9 * ipd);   // on-screen eye shift, never diverging
     float dist = uScreen.z * ipd / (ipd - s);
-    vec3 p = vec3((aPos.x / uFrame.x - 0.5) * uScreen.x, (0.5 - aPos.y / uFrame.y) * uScreen.y, -uScreen.z);
-    gl_Position = uViewProj * vec4(p * (dist / uScreen.z), 1.0);
+    vec2 xy = vec2((aPos.x / uFrame.x - 0.5) * uScreen.x, (0.5 - aPos.y / uFrame.y) * uScreen.y);
+    vec3 p = uStyle.x < 0.5 ? vec3(xy * (dist / uScreen.z), uScreen.z - dist)   // seen from (0, 0, distance)
+                            : vec3(xy, -d * uStyle.y);
+    gl_Position = uViewProj * (uModel * vec4(p, 1.0));
     vTex = aPos;
     vSheet = aSheet;
 }
@@ -58,7 +64,7 @@ struct Eye {
 
 struct Renderer {
     GLuint prog = 0, tex = 0, vao = 0, vbo = 0, ibo = 0;
-    GLint uViewProj, uScreen, uDepth, uFrame, uTex;
+    GLint uViewProj, uScreen, uDepth, uFrame, uTex, uModel, uStyle;
     int indexCount = 0;
     float frameW = 256, frameH = 224;
     Eye eyes[2];
@@ -81,6 +87,8 @@ struct Renderer {
         uDepth = glGetUniformLocation(prog, "uDepth");
         uFrame = glGetUniformLocation(prog, "uFrame");
         uTex = glGetUniformLocation(prog, "uTex");
+        uModel = glGetUniformLocation(prog, "uModel");
+        uStyle = glGetUniformLocation(prog, "uStyle");
 
         glGenTextures(1, &tex);
         glBindTexture(GL_TEXTURE_2D_ARRAY, tex);
@@ -152,7 +160,10 @@ struct Renderer {
     }
 
     // draw into the acquired swapchain image of one eye
-    void drawEye(int eye, uint32_t imageIndex, const XrView &view, const float screen[4], const float depth[4], bool show) {
+    // model: column-major placement matrix; style: {0 screen | 1 box, box metres per SNES pixel};
+    // clearAlpha 0 lets the passthrough room show wherever no sheet is drawn
+    void drawEye(int eye, uint32_t imageIndex, const XrView &view, const float screen[4], const float depth[4],
+                 const float model[16], const float style[2], float clearAlpha, bool show) {
         Eye &e = eyes[eye];
         if (e.fbos[imageIndex] == 0) {
             glGenFramebuffers(1, &e.fbos[imageIndex]);
@@ -162,7 +173,7 @@ struct Renderer {
         }
         glBindFramebuffer(GL_FRAMEBUFFER, e.fbos[imageIndex]);
         glViewport(0, 0, e.w, e.h);
-        glClearColor(0, 0, 0, 1);
+        glClearColor(0, 0, 0, clearAlpha);
         glClearDepthf(1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         if (show && indexCount) {
@@ -176,6 +187,8 @@ struct Renderer {
             glUniform4fv(uScreen, 1, screen);
             glUniform4fv(uDepth, 1, depth);
             glUniform2f(uFrame, frameW, frameH);
+            glUniformMatrix4fv(uModel, 1, GL_FALSE, model);
+            glUniform2fv(uStyle, 1, style);
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D_ARRAY, tex);
             glUniform1i(uTex, 0);
