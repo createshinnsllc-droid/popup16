@@ -101,6 +101,8 @@ struct Renderer {
     GLuint flatProg = 0, flatVao = 0, flatVbo = 0;
     GLint fViewProj = -1, fColor = -1;
     std::vector<FlatShape> shapes;  // drawn after the sheets each frame
+    std::vector<float> opening;     // window style: the frame opening (triangles); sheets show only through it
+    std::vector<FlatShape> inside;  // window style: the box walls behind the opening, clipped like the sheets
     int indexCount = 0;
     float frameW = 256, frameH = 224;
     Eye eyes[2];
@@ -242,16 +244,37 @@ struct Renderer {
             glGenFramebuffers(1, &e.fbos[imageIndex]);
             glBindFramebuffer(GL_FRAMEBUFFER, e.fbos[imageIndex]);
             glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, e.images[imageIndex].image, 0);
-            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, e.depth);
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, e.depth);
         }
         glBindFramebuffer(GL_FRAMEBUFFER, e.fbos[imageIndex]);
         glViewport(0, 0, e.w, e.h);
         glClearColor(0, 0, 0, clearAlpha);
         glClearDepthf(1.0f);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glClearStencil(0);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
         if (show && indexCount) {
             float m[16];
             viewProj(view.pose, view.fov, m);
+            bool clip = !opening.empty();
+            if (clip) {  // mark the window opening in the stencil buffer; the world is drawn only there
+                glEnable(GL_STENCIL_TEST);
+                glStencilFunc(GL_ALWAYS, 1, 0xff);
+                glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+                glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+                glDepthMask(GL_FALSE);
+                glDisable(GL_DEPTH_TEST);
+                glUseProgram(flatProg);
+                glUniformMatrix4fv(fViewProj, 1, GL_FALSE, m);
+                glBindVertexArray(flatVao);
+                glBindBuffer(GL_ARRAY_BUFFER, flatVbo);
+                glBufferData(GL_ARRAY_BUFFER, opening.size() * 4, opening.data(), GL_STREAM_DRAW);
+                glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(opening.size() / 3));
+                glBindVertexArray(0);
+                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+                glDepthMask(GL_TRUE);
+                glStencilFunc(GL_EQUAL, 1, 0xff);
+                glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+            }
             glEnable(GL_DEPTH_TEST);
             glDepthFunc(GL_LEQUAL);  // equal depth: later (higher SNES priority) sheet wins
             glDisable(GL_CULL_FACE);
@@ -273,6 +296,19 @@ struct Renderer {
             glBindVertexArray(vao);
             glDrawElements(GL_TRIANGLES, indexCount, GL_UNSIGNED_INT, nullptr);
             glBindVertexArray(0);
+            if (clip && !inside.empty()) {  // walls of the box, still only through the opening
+                glUseProgram(flatProg);
+                glUniformMatrix4fv(fViewProj, 1, GL_FALSE, m);
+                glBindVertexArray(flatVao);
+                glBindBuffer(GL_ARRAY_BUFFER, flatVbo);
+                for (const auto &sh : inside) {
+                    glBufferData(GL_ARRAY_BUFFER, sh.tris.size() * 4, sh.tris.data(), GL_STREAM_DRAW);
+                    glUniform4fv(fColor, 1, sh.color);
+                    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(sh.tris.size() / 3));
+                }
+                glBindVertexArray(0);
+            }
+            glDisable(GL_STENCIL_TEST);
         }
         if (!shapes.empty()) {  // pointer rays and the grab bar, in room space
             float m[16];
@@ -290,7 +326,7 @@ struct Renderer {
             }
             glBindVertexArray(0);
         }
-        const GLenum discardDepth = GL_DEPTH_ATTACHMENT;
+        const GLenum discardDepth = GL_DEPTH_STENCIL_ATTACHMENT;
         glInvalidateFramebuffer(GL_FRAMEBUFFER, 1, &discardDepth);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
     }

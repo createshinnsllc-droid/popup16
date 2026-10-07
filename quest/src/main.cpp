@@ -765,17 +765,17 @@ static const uint32_t C_BG = 0xff201812, C_TEXT = 0xffe0e0e0, C_DIM = 0xff909090
 
 enum PauseItem { P_RESUME, P_CONTROLS, P_SPEED, P_DEPTH, P_CONV, P_3D, P_MODE7, P_SWAP, P_ROOM, P_STYLE, P_LOOK, P_SKY,
                  P_TABLE, P_RESET, P_SIZE, P_DIST, P_SAVE, P_LOAD, P_SHOT, P_CLIP, P_GAMES, P_ABOUT,
-                 P_PAGE_PICTURE, P_PAGE_ROOM, P_BACK, PAUSE_N };
+                 P_PAGE_PICTURE, P_PAGE_ROOM, P_BACK, P_HANG, PAUSE_N };
 static const char *pauseItems[PAUSE_N] = {
     "Resume", "Controls & remapping", "Game speed", "3D depth", "Convergence", "3D on/off", "Mode 7 floor depth", "Swap eyes",
     "Surroundings", "3D style", "Pop-up look", "Show sky", "Tabletop mode", "Bring it in front of me",
     "Screen size", "Screen distance", "Save state", "Load state", "Take screenshot", "Save last 30 s as video",
-    "Choose game", "About & licenses", "Picture & 3D  >", "Room & placement  >", "<  Back"};
+    "Choose game", "About & licenses", "Picture & 3D  >", "Room & placement  >", "<  Back", "Hang it on the wall"};
 // the pause menu is three short pages instead of one long list
 static const std::vector<int> pausePages[3] = {
     {P_RESUME, P_GAMES, P_SAVE, P_LOAD, P_SHOT, P_CLIP, P_PAGE_PICTURE, P_PAGE_ROOM, P_CONTROLS, P_ABOUT},
     {P_BACK, P_DEPTH, P_CONV, P_3D, P_LOOK, P_MODE7, P_SWAP, P_SPEED},
-    {P_BACK, P_TABLE, P_ROOM, P_SKY, P_STYLE, P_SIZE, P_DIST, P_RESET}};
+    {P_BACK, P_HANG, P_TABLE, P_ROOM, P_SKY, P_STYLE, P_SIZE, P_DIST, P_RESET}};
 static const char *pageTitles[3] = {nullptr, "Picture & 3D", "Room & placement"};
 static int pausePage = 0;
 static bool adjustable(int i) { return i == P_SPEED || i == P_DEPTH || i == P_CONV || i == P_SIZE || i == P_DIST; }
@@ -948,7 +948,7 @@ static void renderMenu() {
             case P_MODE7: v = on(cfg.mode7Ramp) ? "on" : "off"; break;
             case P_SWAP: v = on(cfg.swapEyes) ? "swapped" : "normal"; break;
             case P_ROOM: v = on(cfg.room) ? "your room" : "dark void"; break;
-            case P_STYLE: v = on(cfg.box) ? "pop-up box" : "big screen"; break;
+            case P_STYLE: v = cfg.box > 1.5f ? "window in the wall" : on(cfg.box) ? "pop-up box" : "big screen"; break;
             case P_LOOK: v = on(cfg.popLook) ? "shadows + edges" : "classic"; break;
             case P_SKY: v = on(cfg.sky) ? "on" : "off"; break;
             case P_TABLE: v = on(cfg.table) ? "on" : "off"; break;
@@ -1286,7 +1286,7 @@ static bool initXR(android_app *app) {
             e.fbos.assign(e.images.size(), 0);
             glGenRenderbuffers(1, &e.depth);
             glBindRenderbuffer(GL_RENDERBUFFER, e.depth);
-            glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, e.w, e.h);
+            glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, e.w, e.h);  // stencil: window style
             LOGI("eye %d: %dx%d", eye, e.w, e.h);
         }
     }
@@ -1547,7 +1547,7 @@ static void menuInput(const bool *b) {
         case P_MODE7: flip(cfg.mode7Ramp); break;
         case P_SWAP: flip(cfg.swapEyes); break;
         case P_ROOM: flip(cfg.room); break;
-        case P_STYLE: flip(cfg.box); break;
+        case P_STYLE: cfg.box = (float)(((int)lrintf(cfg.box) + (delta < 0 ? 2 : 1)) % 3); break;
         case P_LOOK: flip(cfg.popLook); break;
         case P_SKY: flip(cfg.sky); break;
         case P_TABLE: setTabletop(!on(cfg.table)); break;
@@ -1568,6 +1568,13 @@ static void menuInput(const bool *b) {
         case P_RESUME: menuMode = MENU_NONE; break;
         case P_CONTROLS: menuMode = MENU_CONTROLS; controlsSel = 0; break;
         case P_RESET: defaultPlacement(); saveGlobal(); showToast("Moved in front of you"); break;
+        case P_HANG:  // a framed window at eye height in front of you; carry it to a wall with the bar
+            cfg.table = 0; cfg.box = 2; cfg.sky = 1; cfg.popLook = 1;
+            if (hasRoomView()) cfg.room = 1;
+            cfg.screenWidth = 1.2f; cfg.distance = 1.6f;
+            defaultPlacement(); saveGlobal(); newFrame = frame.valid;
+            showToast("Point at the bar under the frame and hold the trigger to carry it to a wall");
+            break;
         case P_SAVE: menuMode = MENU_SLOTS; slotSaving = true; break;
         case P_LOAD: menuMode = MENU_SLOTS; slotSaving = false; break;
         case P_SHOT: takeScreenshot(); break;
@@ -1707,7 +1714,7 @@ static void barFrame(XrVector3f &pos, Quat &rot, float &hw, float &hh) {
     float W = cfg.screenWidth, H = W * 3.0f / 4.0f;
     hw = std::clamp(0.3f * W, 0.12f, 0.6f) / 2;
     hh = std::clamp(0.03f * W, 0.012f, 0.05f) / 2;
-    float gap = 0.02f + 0.02f * W;
+    float gap = 0.02f + 0.02f * W + (cfg.box > 1.5f ? std::max(0.03f, 0.05f * W) + 0.01f : 0.0f);  // below the frame
     pos = vadd(v3(cfg.px, cfg.py, cfg.pz), qrot(rot, v3(0, -H / 2 - gap - hh, 0.004f)));
 }
 static void pointerUpdate(XrTime t) {
@@ -1796,6 +1803,55 @@ static void pointerUpdate(XrTime t) {
     renderer.shapes.push_back(sh);
     for (int h = 0; h < 2; h++)
         if (valid[h] && (barHover[h] || grabHand == h)) addRay(org[h], dir[h], grabHand == h ? 0.25f : bt[h], rayCol);
+}
+
+// Window style: the game world lies behind a picture frame; it is only visible through the opening,
+// so the frame reads as a hole in the wall you can look into from any angle.
+static void buildWindow(const float *m) {
+    renderer.opening.clear();
+    renderer.inside.clear();
+    if (cfg.box < 1.5f || !gameLoaded) return;
+    float W = cfg.screenWidth, H = W * 3.0f / 4.0f;
+    auto P = [&](float x, float y, float z) {  // model space to room
+        return v3(m[0] * x + m[4] * y + m[8] * z + m[12], m[1] * x + m[5] * y + m[9] * z + m[13], m[2] * x + m[6] * y + m[10] * z + m[14]);
+    };
+    auto quad = [&](std::vector<float> &out, XrVector3f a, XrVector3f b, XrVector3f c, XrVector3f d) {
+        out.insert(out.end(), {a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z, a.x, a.y, a.z, c.x, c.y, c.z, d.x, d.y, d.z});
+    };
+    quad(renderer.opening, P(-W / 2, -H / 2, 0), P(W / 2, -H / 2, 0), P(W / 2, H / 2, 0), P(-W / 2, H / 2, 0));
+    // picture frame: four moulding pieces around the opening, standing slightly out from the wall,
+    // with a thin light inner lip so the edge of the opening reads clearly
+    float f = std::max(0.03f, 0.05f * W), lip = std::max(0.006f, 0.008f * W), z = 0.012f;
+    render::FlatShape frameSh, lipSh;
+    static const float wood[4] = {0.24f, 0.16f, 0.10f, 1}, lipCol[4] = {0.55f, 0.45f, 0.32f, 1};
+    memcpy(frameSh.color, wood, 16); memcpy(lipSh.color, lipCol, 16);
+    float x0 = -W / 2 - lip, x1 = W / 2 + lip, y0 = -H / 2 - lip, y1 = H / 2 + lip;
+    quad(lipSh.tris, P(x0, y0, z), P(x1, y0, z), P(x1, -H / 2, z), P(x0, -H / 2, z));
+    quad(lipSh.tris, P(x0, H / 2, z), P(x1, H / 2, z), P(x1, y1, z), P(x0, y1, z));
+    quad(lipSh.tris, P(x0, -H / 2, z), P(-W / 2, -H / 2, z), P(-W / 2, H / 2, z), P(x0, H / 2, z));
+    quad(lipSh.tris, P(W / 2, -H / 2, z), P(x1, -H / 2, z), P(x1, H / 2, z), P(W / 2, H / 2, z));
+    float X0 = x0 - f, X1 = x1 + f, Y0 = y0 - f, Y1 = y1 + f, zf = z + 0.004f;
+    quad(frameSh.tris, P(X0, Y0, zf), P(X1, Y0, zf), P(X1, y0, zf), P(X0, y0, zf));
+    quad(frameSh.tris, P(X0, y1, zf), P(X1, y1, zf), P(X1, Y1, zf), P(X0, Y1, zf));
+    quad(frameSh.tris, P(X0, y0, zf), P(x0, y0, zf), P(x0, y1, zf), P(X0, y1, zf));
+    quad(frameSh.tris, P(x1, y0, zf), P(X1, y0, zf), P(X1, y1, zf), P(x1, y1, zf));
+    renderer.shapes.push_back(frameSh);
+    renderer.shapes.push_back(lipSh);
+    // the box behind the frame: four dark walls running back from the opening edges, each a shade
+    // different so the corners read
+    // the walls flare out exactly along the sheet edges seen from the usual spot (distance D in front),
+    // so head-on they are edge-on and invisible; from the side they fill what the game never drew
+    float D = std::max(0.4f, sqrtf(cfg.px * cfg.px + cfg.py * cfg.py + cfg.pz * cfg.pz));
+    float L = 24.0f * D, k = (D + L) / D;
+    static const float wl[4][4] = {{0.10f, 0.09f, 0.09f, 1}, {0.07f, 0.065f, 0.065f, 1}, {0.085f, 0.08f, 0.08f, 1}, {0.12f, 0.11f, 0.105f, 1}};
+    XrVector3f a = P(-W / 2, -H / 2, 0), b = P(W / 2, -H / 2, 0), c = P(W / 2, H / 2, 0), d = P(-W / 2, H / 2, 0);
+    XrVector3f A = P(-W / 2 * k, -H / 2 * k, -L), B = P(W / 2 * k, -H / 2 * k, -L), C = P(W / 2 * k, H / 2 * k, -L), Dd = P(-W / 2 * k, H / 2 * k, -L);
+    render::FlatShape w[4];
+    quad(w[0].tris, a, b, B, A);   // floor
+    quad(w[1].tris, d, c, C, Dd);  // ceiling
+    quad(w[2].tris, a, d, Dd, A);  // left
+    quad(w[3].tris, b, c, C, B);   // right
+    for (int k = 0; k < 4; k++) { memcpy(w[k].color, wl[k], 16); renderer.inside.push_back(w[k]); }
 }
 
 // ---------------------------------------------------------------- main
@@ -2139,7 +2195,8 @@ void android_main(android_app *app) {
             float model[16];
             placementMatrix(model);
             // box style: a full-depth stack is about a third of the width deep, whatever the comfort scale
-            float style[2] = {on(cfg.box) ? 1.0f : 0.0f, 0.04f * cfg.screenWidth / std::max(autoScale, 1e-3f)};
+            float style[2] = {(cfg.box > 0.5f && cfg.box < 1.5f) ? 1.0f : 0.0f, 0.04f * cfg.screenWidth / std::max(autoScale, 1e-3f)};
+            buildWindow(model);
             float depth[4] = {ipd, on(cfg.stereoOn) ? cfg.strength * autoScale : 0.0f, on(cfg.stereoOn) ? cfg.convergence * autoScale : 0.0f, 0.0f};
             for (int eye = 0; eye < 2; eye++) {
                 render::Eye &e = renderer.eyes[eye];
