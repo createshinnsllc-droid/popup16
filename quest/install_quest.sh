@@ -1,10 +1,10 @@
 #!/bin/zsh
 # Installs PopUp16 on a USB-connected Quest, copies the ROM library and starts the app.
-# usage: install_quest.sh [rom folder]   (default: /Volumes/AI MAIN DRIVE/snes-usa-english)
+# usage: install_quest.sh <rom folder>   (folder of .sfc/.smc files you own)
 set -e
 cd "$(dirname "$0")"
 ADB=$HOME/Library/Android/sdk/platform-tools/adb
-ROMS=${1:-"/Volumes/AI MAIN DRIVE/snes-usa-english"}
+ROMS=${1:?usage: install_quest.sh <rom folder>}
 PKG=com.createshinns.popup16
 DEST=/sdcard/Android/data/$PKG/files/roms
 $ADB get-state >/dev/null 2>&1 || { echo "No headset found: plug in the Quest, put it on, and accept 'Allow USB debugging'."; exit 1; }
