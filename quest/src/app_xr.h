@@ -24,6 +24,7 @@ static XrPassthroughLayerFB passthroughLayer = XR_NULL_HANDLE;
 static bool passthroughRunning = false;
 static bool recenterPending = false;  // bring the game back in front once the new head pose is known
 static double recenterAt = 0;          // the runtime applies a recenter a moment after announcing it
+static double focusedSince = 1e18;     // when the session last became focused
 static void resetPassthrough();
 static Swap menuSwap, cursorSwap;
 static XrActionSet actionSet;
@@ -399,6 +400,7 @@ static void handleXrEvents(android_app *app) {
             auto *sc = (XrEventDataSessionStateChanged *)&ev;
             sessionState = sc->state;
             trace("session state %d", (int)sessionState);
+            focusedSince = sessionState == XR_SESSION_STATE_FOCUSED ? nowSec() : 1e18;
             if (sessionState == XR_SESSION_STATE_READY) {
                 XrSessionBeginInfo bi{XR_TYPE_SESSION_BEGIN_INFO};
                 bi.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -417,9 +419,16 @@ static void handleXrEvents(android_app *app) {
         } else if (ev.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
             // Recentering moves the room coordinates with you: the game, its seat and its bar keep their
             // place relative to the new centre (it stays in front of you), and an open menu follows.
-            trace("recentered");
-            recenterPending = true;
-            recenterAt = nowSec() + 0.3;
+            // The runtime also sends this while a session is still starting up; only a recenter the
+            // player makes during play (session focused for a while) moves the game, so a saved
+            // placement (on a wall, on a table) is never thrown away at launch.
+            if (sessionState == XR_SESSION_STATE_FOCUSED && nowSec() - focusedSince > 2.0) {
+                trace("recentered");
+                recenterPending = true;
+                recenterAt = nowSec() + 0.3;
+            } else {
+                trace("recenter event ignored (session starting)");
+            }
         } else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
             ANativeActivity_finish(app->activity);
         }
