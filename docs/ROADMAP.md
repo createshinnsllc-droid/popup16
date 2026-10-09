@@ -8,8 +8,8 @@ and strike items through when they ship (with the PR link).
 
 ## Quality of life (one per week)
 
-1. **Cursor and text size for comfort:** a readability pass on every menu at 1.3 m (larger body text,
-   more contrast), plus an optional "large text" setting.
+1. ~~**Cursor and text size for comfort:**~~ **partly shipped (PR #6):** high-contrast menu option. Still open:
+   larger body text ("large text" setting) and a pointer size option.
 2. **Recently played on launch:** open straight into the last game, with a one-tap "Choose another game"
    card instead of the full library.
 3. **Library search:** jump by first letter with the right stick; show the letter while scrolling.
@@ -26,7 +26,7 @@ and strike items through when they ship (with the PR link).
 
 1. **Widescreen worlds:** draw background layers past the 4:3 edges from the full tilemaps in the core, so
    the world wraps around the window.
-2. **Sprite thickness:** give sprites a few millimetres of real depth (extruded edges) in pop-up box style.
+2. ~~**Sprite thickness:**~~ **shipped (PR #7):** 4 mm card edges in pop-up box style. Still open: edge colour from the sprite palette.
 3. **Living backdrop:** a slow parallax sky beyond the game's backdrop, matched to its colours.
 4. **Mode 7 sky dome:** curve the horizon backdrop of Mode 7 racers into a dome around the track.
 5. **Hand presence:** see your controllers as small SNES pads in the room.
@@ -52,3 +52,4 @@ and strike items through when they ship (with the PR link).
 | Week | Quality of life | Novel upgrade |
 |---|---|---|
 | 2026-10-07 | Library, remapping, capture, pointer menus, grab bar, recenter (PRs #1-#4) | Diorama renderer, Mode 7 3D floor, room mode, window in the wall |
+| 2026-10-09 | High-contrast menu option (PR #6) | Sprite thickness, 4 mm card edges (PR #7) |
