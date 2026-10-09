@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 import unittest
+import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
 OUTPUT = ROOT / "test/output"
@@ -173,6 +174,8 @@ def self_test(binary):
                         *flags, str(source), "-o", str(target)], check=True)
     rom = out / "dummy.sfc"
     rom.write_bytes(b"synthetic fixture")
+    zip_fixture = out / "bracket.zip"
+    subprocess.run([sys.executable, str(ROOT / "test/make_zip_fixture.py"), str(zip_fixture)], check=True)
 
     class Checks(unittest.TestCase):
         def run_case(self, name, **kwargs):
@@ -241,6 +244,18 @@ def self_test(binary):
             with self.assertRaises(ValueError): verdict(r, d)
             (d / "plane0.bmp").unlink()
             with self.assertRaises(FileNotFoundError): verdict(r, d)
+
+        def test_zip_bracket_member_extracts(self):
+            # the picked member name contains [!]; the extracted bytes must equal the archive member
+            dest = out / "zip-bracket"
+            r = execute(binary, core, zip_fixture, dest, 12)
+            self.assertEqual(verdict(r, dest)["mismatches"], 0)
+            self.assertIn("picked Test Game (U) [!].sfc", r["text"])
+            with zipfile.ZipFile(zip_fixture) as archive:
+                expected = archive.read("Test Game (U) [!].sfc")
+            self.assertGreater(len(expected), 0)
+            extracted = dest / "home/Library/Application Support/PopUp16/tmp/current.rom"
+            self.assertEqual(extracted.read_bytes(), expected)
 
         def test_environment_isolation(self):
             env = isolated_env(out / "isolated-home")

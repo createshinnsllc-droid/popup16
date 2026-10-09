@@ -21,6 +21,11 @@ ROM="$1"
 if [[ -z "$ROM" ]]; then
   ROM=$(osascript -e 'POSIX path of (choose file with prompt "Pick a SNES ROM (.sfc / .smc / .zip)")') || exit 0
 fi
+if [[ ! -f "$ROM" || ! -r "$ROM" ]]; then
+  LOG=$(tail -n 5 ~/Library/Logs/PopUp16.log 2>/dev/null)
+  osascript -e 'on run argv' -e 'display alert "PopUp16 could not open this ROM" message ("File: " & (item 1 of argv) & return & return & (item 2 of argv))' -e 'end run' "$ROM" "$LOG" >/dev/null 2>&1
+  exit 1
+fi
 exec "$RES/popup16" "$RES/snes9x_libretro.dylib" "$ROM" >> ~/Library/Logs/PopUp16.log 2>&1
 SH
 chmod +x "$APP/Contents/MacOS/PopUp16"
