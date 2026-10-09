@@ -118,6 +118,7 @@ struct Renderer {
         return s;
     }
     bool init() {
+        indexCount = 0;  // a re-init must not draw with the count from the previous session
         prog = glCreateProgram();
         glAttachShader(prog, compile(GL_VERTEX_SHADER, kVS));
         glAttachShader(prog, compile(GL_FRAGMENT_SHADER, kFS));
