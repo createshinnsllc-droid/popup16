@@ -224,6 +224,15 @@ static std::string shq(const std::string &s) {
     for (char c : s) { if (c == '\'') r += "'\\''"; else r += c; }
     return r + "'";
 }
+// unzip reads member names as wildcard patterns; escape [ * ? so the exact name matches
+static std::string unzipLiteral(const std::string &s) {
+    std::string r;
+    for (char c : s) {
+        if (c == '[' || c == '*' || c == '?') { r += '['; r += c; r += ']'; }
+        else r += c;
+    }
+    return r;
+}
 static std::string sevenZip() {
     for (const char *c : {"/opt/homebrew/bin/7zz", "/opt/homebrew/bin/7z", "/usr/local/bin/7zz", "/usr/local/bin/7z"})
         if (access(c, X_OK) == 0) return c;
@@ -305,7 +314,7 @@ int main(int argc, char **argv) {
         std::string tmp = base + "/tmp";
         mkdir(tmp.c_str(), 0755);
         std::string out = tmp + "/current.rom";
-        std::string ex = (ext == "7z" ? sz + " e -so " + q + " " + shq(best) : "/usr/bin/unzip -p " + q + " " + shq(best)) + " > " + shq(out) + " 2>/dev/null";
+        std::string ex = (ext == "7z" ? sz + " e -so " + q + " " + shq(best) : "/usr/bin/unzip -p " + q + " " + shq(unzipLiteral(best))) + " > " + shq(out) + " 2>/dev/null";
         if (system(ex.c_str()) != 0) { fprintf(stderr, "extract failed: %s\n", best.c_str()); return 1; }
         printf("picked %s\n", best.c_str());
         romPath = out;
