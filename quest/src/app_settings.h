@@ -8,7 +8,7 @@ struct Settings {
     // per game
     float strength = 1.0f, convergence = 0.0f, mode7Ramp = 1, swapEyes = 0, stereoOn = 1;
     // global: how and where the diorama sits in the room
-    float screenWidth = 2.4f, distance = 2.2f, room = 0, box = 0, popLook = 1, sky = 1, speed = 1, table = 0;
+    float screenWidth = 2.4f, distance = 2.2f, room = 0, box = 0, popLook = 1, sky = 1, speed = 1, table = 0, contrast = 0;
     float px = 0, py = 0, pz = -2.2f, qx = 0, qy = 0, qz = 0, qw = 1;
     // the viewer position the screen was placed for; window/box depth is measured from here rather
     // than from the LOCAL origin, so a recenter or a different chair cannot leave it stale
@@ -22,6 +22,7 @@ static const struct { const char *name; float Settings::*field; bool global; flo
     {"stereoOn", &Settings::stereoOn, false, 0.0f, 1.0f}, {"screenWidth", &Settings::screenWidth, true, 0.3f, 8.0f},
     {"distance", &Settings::distance, true, 0.4f, 8.0f}, {"room", &Settings::room, true, 0.0f, 1.0f}, {"box", &Settings::box, true, 0.0f, 2.0f},
     {"popLook", &Settings::popLook, true, 0.0f, 1.0f}, {"sky", &Settings::sky, true, 0.0f, 1.0f}, {"speed", &Settings::speed, true, 0.25f, 4.0f}, {"table", &Settings::table, true, 0.0f, 1.0f},
+    {"contrast", &Settings::contrast, true, 0.0f, 1.0f},
     {"px", &Settings::px, true, -50.0f, 50.0f}, {"py", &Settings::py, true, -50.0f, 50.0f}, {"pz", &Settings::pz, true, -50.0f, 50.0f},
     {"qx", &Settings::qx, true, -1.0f, 1.0f}, {"qy", &Settings::qy, true, -1.0f, 1.0f}, {"qz", &Settings::qz, true, -1.0f, 1.0f}, {"qw", &Settings::qw, true, -1.0f, 1.0f},
     {"seatX", &Settings::seatX, true, -50.0f, 50.0f}, {"seatY", &Settings::seatY, true, -50.0f, 50.0f}, {"seatZ", &Settings::seatZ, true, -50.0f, 50.0f},
