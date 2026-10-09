@@ -234,8 +234,8 @@ struct Renderer {
         };
         for (const auto &w : walls) {
             // one quad: front and back edges over rows v0..v1 at column u
-            put(w.u, w.v0, w.dFront, 0.0f); put(w.u, w.v1, w.dFront, 0.0f); put(w.u, w.v0, w.dFront, -WALL_THICKNESS_M);
-            put(w.u, w.v1, w.dFront, 0.0f); put(w.u, w.v1, w.dFront, -WALL_THICKNESS_M); put(w.u, w.v0, w.dFront, -WALL_THICKNESS_M);
+            put(w.u, w.v0, w.dFront, 0.0f); put(w.u, w.v1, w.dBottom, 0.0f); put(w.u, w.v0, w.dFront, -WALL_THICKNESS_M);
+            put(w.u, w.v1, w.dBottom, 0.0f); put(w.u, w.v1, w.dBottom, -WALL_THICKNESS_M); put(w.u, w.v0, w.dFront, -WALL_THICKNESS_M);
         }
         shapes.push_back(FlatShape{wallTris, {0.20f, 0.17f, 0.15f, 1.0f}});  // dark warm card edge
     }

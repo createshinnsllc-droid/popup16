@@ -28,11 +28,12 @@ struct Quad {
     float m7uv[4][2];    // map texel coords at top-left, top-right, bottom-left, bottom-right
 };
 
-// Card edge of a sprite span (spriteWalls only): a vertical strip at column u over rows [v0, v1), at disparity
-// dFront (the sprite face). Its depth in metres is added by the renderer. Drawn as geometry, not in the quads.
+// Card edge of a sprite span (spriteWalls only): a vertical strip at column u over rows [v0, v1). Its top
+// edge sits at disparity dFront and its bottom edge at dBottom, the same two depths the sprite quad uses (they
+// differ on a sloping Mode 7 floor). Its depth in metres is added by the renderer. Drawn as geometry, not in the quads.
 struct Wall {
     float u, v0, v1;
-    float dFront;
+    float dFront, dBottom;
 };
 
 struct Input {
@@ -248,8 +249,8 @@ struct Builder {
         if (spriteWalls)
             for (const auto &q : quads)
                 if ((int)q.slice == 4) {
-                    walls.push_back({q.u0, q.v, q.v + 1.0f, q.disparity});
-                    walls.push_back({q.u1, q.v, q.v + 1.0f, q.disparity});
+                    walls.push_back({q.u0, q.v, q.v + 1.0f, q.disparity, q.disparity1});
+                    walls.push_back({q.u1, q.v, q.v + 1.0f, q.disparity, q.disparity1});
                 }
         double t2 = nowMs();
         if (frameHasM7) buildMap7(in);

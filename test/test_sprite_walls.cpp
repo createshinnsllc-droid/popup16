@@ -97,10 +97,13 @@ int main() {
                                                        right.v0 == 1.0f && right.v1 == right.v0 + 1.0f);
         check("walls start at the sprite face (dFront == span disparity)",
               left.dFront == sprite->disparity && right.dFront == sprite->disparity);
+        check("walls take their bottom edge from the quad's disparity1 (flat floor: equal)",
+              left.dBottom == sprite->disparity1 && right.dBottom == sprite->disparity1);
     } else {
         check("walls sit on the span edges: one at u = 2, one at u = 4", false);
         check("walls cover row 1 only (v1 == v0 + 1)", false);
         check("walls start at the sprite face (dFront == span disparity)", false);
+        check("walls take their bottom edge from the quad's disparity1 (flat floor: equal)", false);
     }
 
     card->spriteWalls = false;
