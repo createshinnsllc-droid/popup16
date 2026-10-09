@@ -181,6 +181,7 @@ static void menuInput(const bool *b) {
         case P_ROOM: flip(cfg.room); break;
         case P_STYLE: cfg.box = (float)(((int)lrintf(cfg.box) + (delta < 0 ? 2 : 1)) % 3); break;
         case P_LOOK: flip(cfg.popLook); break;
+        case P_CONTRAST: flip(cfg.contrast); applyPalette(); menuDirty = true; break;  // saved by the changed path below
         case P_SKY: flip(cfg.sky); break;
         case P_TABLE: setTabletop(!on(cfg.table)); break;
         case P_SIZE: cfg.screenWidth = std::clamp(cfg.screenWidth + 0.2f * delta, 0.3f, 8.0f); break;

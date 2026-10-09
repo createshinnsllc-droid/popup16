@@ -107,6 +107,7 @@ void android_main(android_app *app) {
     romDir = filesDir + "/roms"; saveDir = filesDir + "/saves"; sysDir = filesDir + "/system";
     mkdir(filesDir.c_str(), 0775); mkdir(romDir.c_str(), 0775); mkdir(saveDir.c_str(), 0775); mkdir(sysDir.c_str(), 0775);
     loadSettings(filesDir + "/settings.cfg", true);
+    applyPalette();
     traceFile = fopen((filesDir + "/input.log").c_str(), "a");
     trace("---- start, ROM folder %s", romDir.c_str());
     {
