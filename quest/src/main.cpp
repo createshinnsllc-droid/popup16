@@ -178,7 +178,9 @@ void android_main(android_app *app) {
     double lastEmu = nowSec();
     while (!app->destroyRequested) {
         int events; android_poll_source *source;
-        while (ALooper_pollOnce(sessionRunning || !instance || gameLoaded ? 0 : 100, nullptr, &events, (void **)&source) >= 0) {
+        // same check as the headless branch below; that branch keeps its own copy
+        static bool headlessIdle = kDevHooks && access((filesDir + "/debug_headless").c_str(), F_OK) == 0;
+        while (ALooper_pollOnce(sessionRunning || headlessIdle ? 0 : 100, nullptr, &events, (void **)&source) >= 0) {
             if (source) source->process(app, source);
             if (app->destroyRequested) break;
         }

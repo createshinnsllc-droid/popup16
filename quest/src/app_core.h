@@ -32,7 +32,10 @@ struct BuildWorker {
     std::condition_variable cv;
     std::thread th;
 
-    void start() { th = std::thread([this] { loop(); }); }
+    void start() {  // a re-entered session (Quest leaves to Home and returns in the same process) starts clean
+        { std::lock_guard<std::mutex> l(m); quit = false; hasJob = false; ready = -1; uploading = -1; builtGen[0] = builtGen[1] = builtGen[2] = 0; }
+        th = std::thread([this] { loop(); });
+    }
     void stop() { { std::lock_guard<std::mutex> l(m); quit = true; } cv.notify_one(); if (th.joinable()) th.join(); }
     void loop() {
         Job local;
