@@ -28,6 +28,13 @@ struct Quad {
     float m7uv[4][2];    // map texel coords at top-left, top-right, bottom-left, bottom-right
 };
 
+// Card edge of a sprite span (thickness > 0 only): a vertical strip at column u over rows [v0, v1),
+// running from disparity dFront (the sprite face) back to dBack. Drawn as geometry, not in the quads.
+struct Wall {
+    float u, v0, v1;
+    float dFront, dBack;
+};
+
 struct Input {
     unsigned w, h;
     const uint16_t *rgb565;        // composited frame, w x h, tightly packed
@@ -83,6 +90,8 @@ struct Look {
 struct Builder {
     std::vector<uint32_t> tex;   // SLICES x TEX_H x TEX_W, RGBA bytes (R in the low byte)
     std::vector<Quad> quads;
+    std::vector<Wall> walls;    // sprite card edges, filled only when thickness > 0
+    float thickness = 0.0f;     // SNES pixels a sprite card is thick (0 = flat sheets, no walls)
     bool mode7Ramp = true;
     bool showBackdrop = true;   // false: no backdrop sheet, so the room shows through behind the game
     Look look;
@@ -108,6 +117,7 @@ struct Builder {
         const unsigned w = std::min<unsigned>(in.w, TEX_W), h = std::min<unsigned>(in.h, TEX_H);
         lastW = w; lastH = h;
         quads.clear();
+        walls.clear();
 
         // which mode family is on screen (BG3 only exists in modes 0/1; BG1 low priority is 11 there, 7 in modes 2+)
         bool mode01 = true;
@@ -234,6 +244,13 @@ struct Builder {
                 q.disparity1 = q.disparity;
                 quads.push_back(q);
             }
+        // sprite cards: each span gets a wall on its left and right edge, from its face back by thickness
+        if (thickness > 0.0f)
+            for (const auto &q : quads)
+                if ((int)q.slice == 4) {
+                    walls.push_back({q.u0, q.v, q.v + 1.0f, q.disparity, q.disparity + thickness});
+                    walls.push_back({q.u1, q.v, q.v + 1.0f, q.disparity, q.disparity + thickness});
+                }
         double t2 = nowMs();
         if (frameHasM7) buildMap7(in);
         double t3 = nowMs();

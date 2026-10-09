@@ -417,6 +417,7 @@ void android_main(android_app *app) {
                 for (int n = 0; n < 5; n++) { j.planeColor[n] = planeColor[n]; j.planeZ[n] = planeZ[n]; }
                 j.lines = m7lines; j.vram = m7vram; j.cgram = m7cgram; j.flags = m7flags;
                 j.ramp = on(cfg.mode7Ramp); j.look = on(cfg.popLook); j.backdrop = on(cfg.sky) || !on(cfg.room);
+                j.thickness = (cfg.box > 0.5f && cfg.box < 1.5f && on(cfg.popLook)) ? 2.0f : 0.0f;  // pop-up box cards have edges
                 j.gen = gameGen;
                 worker.hasJob = true;
             }
@@ -486,6 +487,7 @@ void android_main(android_app *app) {
             float style[2] = {(cfg.box > 0.5f && cfg.box < 1.5f) ? 1.0f : 0.0f, 0.04f * cfg.screenWidth / std::max(autoScale, 1e-3f)};
             buildWindow(model);
             float depth[4] = {ipd, on(cfg.stereoOn) ? cfg.strength * autoScale : 0.0f, on(cfg.stereoOn) ? cfg.convergence * autoScale : 0.0f, 0.0f};
+            if (style[0] > 0.5f && gameLoaded && frame.valid) renderer.pushWalls(screen, depth, model, style);  // box style: sprite card edges
             for (int eye = 0; eye < 2; eye++) {
                 render::Eye &e = renderer.eyes[eye];
                 uint32_t idx;
