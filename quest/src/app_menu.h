@@ -107,16 +107,16 @@ static void applyPalette() {
 
 enum PauseItem { P_RESUME, P_CONTROLS, P_SPEED, P_DEPTH, P_CONV, P_3D, P_MODE7, P_SWAP, P_ROOM, P_STYLE, P_LOOK, P_CONTRAST, P_SKY,
                  P_TABLE, P_RESET, P_SIZE, P_DIST, P_SAVE, P_LOAD, P_SHOT, P_CLIP, P_GAMES, P_ABOUT,
-                 P_PAGE_PICTURE, P_PAGE_ROOM, P_BACK, P_SEAT, P_HANG, PAUSE_N };
+                 P_PAGE_PICTURE, P_PAGE_ROOM, P_BACK, P_SEAT, P_HANG, P_DEFAULTS, PAUSE_N };
 static const char *pauseItems[PAUSE_N] = {
     "Resume", "Controls & remapping", "Game speed", "3D depth", "Convergence", "3D on/off", "Mode 7 floor depth", "Swap eyes",
     "Surroundings", "3D style", "Pop-up look", "Menu contrast", "Show sky", "Tabletop mode", "Bring it in front of me",
     "Screen size", "Screen distance", "Save state", "Load state", "Take screenshot", "Save last 30 s as video",
     "Choose game", "About & licenses", "Picture & 3D  >", "Room & placement  >", "<  Back",
-    "This is my seat", "Hang it on the wall"};
+    "This is my seat", "Hang it on the wall", "Back to default settings"};
 // the pause menu is three short pages instead of one long list
 static const std::vector<int> pausePages[3] = {
-    {P_RESUME, P_GAMES, P_SAVE, P_LOAD, P_SHOT, P_CLIP, P_PAGE_PICTURE, P_PAGE_ROOM, P_CONTROLS, P_ABOUT},
+    {P_RESUME, P_GAMES, P_SAVE, P_LOAD, P_SHOT, P_CLIP, P_PAGE_PICTURE, P_PAGE_ROOM, P_CONTROLS, P_DEFAULTS, P_ABOUT},
     {P_BACK, P_DEPTH, P_CONV, P_3D, P_LOOK, P_CONTRAST, P_MODE7, P_SWAP, P_SPEED},
     {P_BACK, P_HANG, P_SEAT, P_TABLE, P_ROOM, P_SKY, P_STYLE, P_SIZE, P_DIST, P_RESET}};
 static const char *pageTitles[3] = {nullptr, "Picture & 3D", "Room & placement"};
@@ -148,6 +148,21 @@ static void defaultPlacement() {  // straight ahead of where you are looking, up
     float fx, fz; yawFwd(fx, fz);
     cfg.px = headX + fx * cfg.distance; cfg.py = headY; cfg.pz = headZ + fz * cfg.distance;
     cfg.qx = 0; cfg.qy = sinf(headYaw / 2); cfg.qz = 0; cfg.qw = cosf(headYaw / 2);
+}
+// Back to default settings: every display, 3D, room and placement setting goes back to the shipped
+// default. Controls, library, covers, saves and games are never touched.
+static void resetDisplaySettings() {
+    Settings d;
+    cfg.strength = d.strength; cfg.convergence = d.convergence; cfg.mode7Ramp = d.mode7Ramp;
+    cfg.swapEyes = d.swapEyes; cfg.stereoOn = d.stereoOn;
+    cfg.screenWidth = d.screenWidth; cfg.distance = d.distance; cfg.room = d.room; cfg.box = d.box;
+    cfg.popLook = d.popLook; cfg.sky = d.sky; cfg.speed = d.speed; cfg.table = d.table; cfg.contrast = d.contrast;
+    cfg.seatX = d.seatX; cfg.seatY = d.seatY; cfg.seatZ = d.seatZ; cfg.seatMarked = d.seatMarked;
+    defaultPlacement();  // uses the default distance just set
+    applyPalette();
+    saveGlobal();
+    if (gameLoaded) saveSettings(saveDir + "/" + stem() + ".cfg", false);  // this game's own values too
+    newFrame = frame.valid;
 }
 // Tabletop: a small pop-up box standing on the table in front of you, room visible around it
 static bool hasRoomView();
