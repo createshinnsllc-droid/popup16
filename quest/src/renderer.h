@@ -103,6 +103,8 @@ struct Renderer {
     std::vector<FlatShape> shapes;  // drawn after the sheets each frame
     std::vector<float> opening;     // window style: the frame opening (triangles); sheets show only through it
     std::vector<FlatShape> inside;  // window style: the box walls behind the opening, clipped like the sheets
+    std::vector<diorama::Wall> walls;  // sprite card edges of the shown build (copied at upload)
+    std::vector<float> wallTris;       // box style: those walls as room-space triangles, reused each frame
     bool captureEye = false;        // debug: read back the next left-eye image
     std::vector<uint8_t> eyePixels; int eyeW = 0, eyeH = 0;
     int indexCount = 0;
@@ -174,6 +176,7 @@ struct Renderer {
     // upload the sheet textures and geometry for a new frame
     void upload(diorama::Builder &b, unsigned w, unsigned h) {
         frameW = (float)w; frameH = (float)h;
+        walls.assign(b.walls.begin(), b.walls.end());  // copied: the builder may be reused once uploaded
         glBindTexture(GL_TEXTURE_2D_ARRAY, tex);
         glPixelStorei(GL_UNPACK_ROW_LENGTH, diorama::TEX_W);
         glPixelStorei(GL_UNPACK_IMAGE_HEIGHT, diorama::TEX_H);
@@ -211,6 +214,30 @@ struct Renderer {
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, idx.size() * 4, idx.data(), GL_STREAM_DRAW);
         indexCount = (int)idx.size();
+    }
+
+    // Sprite card thickness in metres: the back edge of each wall sits this far behind the sprite face,
+    // in model space (before the placement matrix), so it does not depend on screen width or strength.
+    static constexpr float WALL_THICKNESS_M = 0.004f;
+
+    // Box style with pop-up look: each sprite card's edges as one flat dark shape (two triangles per wall).
+    // Vertices use the sheet vertex shader's box mapping (screen position, depth from disparity), then the
+    // placement matrix, so the walls line up with the sheets. Call once per frame, after shapes.clear().
+    void pushWalls(const float screen[4], const float depth[4], const float model[16], const float style[2]) {
+        if (walls.empty()) return;
+        wallTris.clear();
+        // dz: offset along model z from the sprite face (0 = front edge, -WALL_THICKNESS_M = back edge)
+        auto put = [&](float u, float v, float dWall, float dz) {
+            float d = dWall * depth[1] + depth[2];
+            float p[3] = {(u / frameW - 0.5f) * screen[0], (0.5f - v / frameH) * screen[1], -d * style[1] + dz};
+            for (int r = 0; r < 3; r++) wallTris.push_back(model[r] * p[0] + model[4 + r] * p[1] + model[8 + r] * p[2] + model[12 + r]);
+        };
+        for (const auto &w : walls) {
+            // one quad: front and back edges over rows v0..v1 at column u
+            put(w.u, w.v0, w.dFront, 0.0f); put(w.u, w.v1, w.dBottom, 0.0f); put(w.u, w.v0, w.dFront, -WALL_THICKNESS_M);
+            put(w.u, w.v1, w.dBottom, 0.0f); put(w.u, w.v1, w.dBottom, -WALL_THICKNESS_M); put(w.u, w.v0, w.dFront, -WALL_THICKNESS_M);
+        }
+        shapes.push_back(FlatShape{wallTris, {0.20f, 0.17f, 0.15f, 1.0f}});  // dark warm card edge
     }
 
     static void viewProj(const XrPosef &pose, const XrFovf &fov, float *m) {

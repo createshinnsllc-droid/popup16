@@ -20,6 +20,7 @@ struct BuildWorker {
         std::vector<uint16_t> cgram;
         int flags = 0;
         bool ramp = true, look = true, backdrop = true;
+        bool spriteWalls = false;  // sprite card edges (pop-up box style with the pop-up look)
         unsigned gen = 0;          // game generation this frame belongs to
     };
     Job job;                      // filled by the display loop under lock
@@ -50,7 +51,7 @@ struct BuildWorker {
             diorama::Input din{local.w, local.h, local.rgb565.data(), local.layers.data(), local.depths.data(), {}, {}};
             for (int n = 0; n < 5; n++) { din.planeColor[n] = local.planeColor[n].data(); din.planeZ[n] = local.planeZ[n].data(); }
             if (!local.lines.empty()) { din.m7lines = local.lines.data(); din.vram = local.vram.data(); din.cgram = local.cgram.data(); din.m7flags = local.flags; }
-            b.mode7Ramp = local.ramp; b.look.on = local.look; b.showBackdrop = local.backdrop;
+            b.mode7Ramp = local.ramp; b.look.on = local.look; b.showBackdrop = local.backdrop; b.spriteWalls = local.spriteWalls;
             b.build(din);
             std::lock_guard<std::mutex> l(m);
             builtGen[target] = local.gen;
