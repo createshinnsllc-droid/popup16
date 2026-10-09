@@ -135,7 +135,12 @@ static void menuInput(const bool *b) {
             if (ok) {
                 std::string pick = libView[romSel];
                 bool firstTime = stats[pick].seconds < 1;
-                if (loadGame(pick)) { menuMode = firstTime ? MENU_HELP : MENU_NONE; resetMenuInput(); }
+                // read before loadGame, which rewrites last_game.txt for the game it unloads
+                bool resumePick = on(cfg.startLibrary) && pick == lastGameName();
+                if (loadGame(pick)) {
+                    if (resumePick) resumeLoadedGame(pick);
+                    menuMode = firstTime ? MENU_HELP : MENU_NONE; resetMenuInput();
+                }
                 else showToast("Could not load that ROM");
             }
         }
@@ -183,6 +188,7 @@ static void menuInput(const bool *b) {
         case P_LOOK: flip(cfg.popLook); break;
         case P_CONTRAST: flip(cfg.contrast); applyPalette(); menuDirty = true; break;  // saved by the changed path below
         case P_SKY: flip(cfg.sky); break;
+        case P_STARTLIB: flip(cfg.startLibrary); break;  // saved by the changed path below
         case P_TABLE: setTabletop(!on(cfg.table)); break;
         case P_SIZE: cfg.screenWidth = std::clamp(cfg.screenWidth + 0.2f * delta, 0.3f, 8.0f); break;
         case P_DIST: {

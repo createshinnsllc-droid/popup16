@@ -107,22 +107,22 @@ static void applyPalette() {
 
 enum PauseItem { P_RESUME, P_CONTROLS, P_SPEED, P_DEPTH, P_CONV, P_3D, P_MODE7, P_SWAP, P_ROOM, P_STYLE, P_LOOK, P_CONTRAST, P_SKY,
                  P_TABLE, P_RESET, P_SIZE, P_DIST, P_SAVE, P_LOAD, P_SHOT, P_CLIP, P_GAMES, P_ABOUT,
-                 P_PAGE_PICTURE, P_PAGE_ROOM, P_BACK, P_SEAT, P_HANG, P_DEFAULTS, PAUSE_N };
+                 P_PAGE_PICTURE, P_PAGE_ROOM, P_BACK, P_SEAT, P_HANG, P_DEFAULTS, P_STARTLIB, PAUSE_N };
 static const char *pauseItems[PAUSE_N] = {
     "Resume", "Controls & remapping", "Game speed", "3D depth", "Convergence", "3D on/off", "Mode 7 floor depth", "Swap eyes",
     "Surroundings", "3D style", "Pop-up look", "Menu contrast", "Show sky", "Tabletop mode", "Bring it in front of me",
     "Screen size", "Screen distance", "Save state", "Load state", "Take screenshot", "Save last 30 s as video",
     "Choose game", "About & licenses", "Picture & 3D  >", "Room & placement  >", "<  Back",
-    "This is my seat", "Hang it on the wall", "Back to default settings"};
+    "This is my seat", "Hang it on the wall", "Back to default settings", "Start in library"};
 // the pause menu is three short pages instead of one long list
 static const std::vector<int> pausePages[3] = {
-    {P_RESUME, P_GAMES, P_SAVE, P_LOAD, P_SHOT, P_CLIP, P_PAGE_PICTURE, P_PAGE_ROOM, P_CONTROLS, P_DEFAULTS, P_ABOUT},
+    {P_RESUME, P_GAMES, P_STARTLIB, P_SAVE, P_LOAD, P_SHOT, P_CLIP, P_PAGE_PICTURE, P_PAGE_ROOM, P_CONTROLS, P_DEFAULTS, P_ABOUT},
     {P_BACK, P_DEPTH, P_CONV, P_3D, P_LOOK, P_CONTRAST, P_MODE7, P_SWAP, P_SPEED},
     {P_BACK, P_HANG, P_SEAT, P_TABLE, P_ROOM, P_SKY, P_STYLE, P_SIZE, P_DIST, P_RESET}};
 static const char *pageTitles[3] = {nullptr, "Picture & 3D", "Room & placement"};
 static int pausePage = 0;
 static bool adjustable(int i) { return i == P_SPEED || i == P_DEPTH || i == P_CONV || i == P_SIZE || i == P_DIST; }
-static bool toggle(int i) { return i == P_3D || i == P_MODE7 || i == P_SWAP || i == P_ROOM || i == P_STYLE || i == P_LOOK || i == P_CONTRAST || i == P_SKY || i == P_TABLE; }
+static bool toggle(int i) { return i == P_3D || i == P_MODE7 || i == P_SWAP || i == P_ROOM || i == P_STYLE || i == P_LOOK || i == P_CONTRAST || i == P_SKY || i == P_TABLE || i == P_STARTLIB; }
 // where the head is (LOCAL space), updated every frame; menus and placement presets follow its yaw
 static float headX = 0, headY = 0, headZ = 0, headYaw = 0;
 static void yawFwd(float &fx, float &fz) { fx = -sinf(headYaw); fz = -cosf(headYaw); }
@@ -335,6 +335,7 @@ static void renderMenu() {
             case P_CONTRAST: v = on(cfg.contrast) ? "high" : "normal"; break;
             case P_SKY: v = on(cfg.sky) ? "on" : "off"; break;
             case P_TABLE: v = on(cfg.table) ? "on" : "off"; break;
+            case P_STARTLIB: v = on(cfg.startLibrary) ? "library" : "continue"; break;
             case P_SIZE: snprintf(buf, sizeof buf, "%.1f m", cfg.screenWidth); v = buf; break;
             case P_DIST: snprintf(buf, sizeof buf, "%.1f m", cfg.distance); v = buf; break;
             case P_SEAT: v = on(cfg.seatMarked) ? "depth from your seat" : "not marked yet"; break;

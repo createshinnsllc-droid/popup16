@@ -158,16 +158,17 @@ void android_main(android_app *app) {
             while (!n.empty() && (n.back() == '\n' || n.back() == '\r')) n.pop_back();
             remove((filesDir + "/autostart.txt").c_str());
             if (loadGame(n)) menuMode = MENU_NONE;
+        } else if (on(cfg.startLibrary)) {
+            // start in the library: nothing loads, and the last game is highlighted for a quick pick
+            menuMode = MENU_ROMS;
+            auto it = std::find(libView.begin(), libView.end(), lastGameName());
+            if (it != libView.end()) romSel = (int)(it - libView.begin());
         } else if (readFile(filesDir + "/last_game.txt", a)) {
             // quick resume: reopen the last game exactly where it was left
             std::string n(a.begin(), a.end());
-            std::vector<uint8_t> st;
             if (n.find('/') == std::string::npos && loadGame(n)) {
-                bool restored = readFile(saveDir + "/" + stem() + ".resume", st) && !st.empty() && retro_unserialize(st.data(), st.size());
+                resumeLoadedGame(n);
                 menuMode = MENU_NONE;
-                if (restored) trace("resumed %s", n.c_str());
-                else { trace("resume state for %s could not be restored; starting from its last save", n.c_str());
-                       showToast("Couldn't restore where you left off - started from your last save"); }
             }
         }
     }
