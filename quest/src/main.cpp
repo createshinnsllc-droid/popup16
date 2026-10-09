@@ -417,7 +417,7 @@ void android_main(android_app *app) {
                 for (int n = 0; n < 5; n++) { j.planeColor[n] = planeColor[n]; j.planeZ[n] = planeZ[n]; }
                 j.lines = m7lines; j.vram = m7vram; j.cgram = m7cgram; j.flags = m7flags;
                 j.ramp = on(cfg.mode7Ramp); j.look = on(cfg.popLook); j.backdrop = on(cfg.sky) || !on(cfg.room);
-                j.thickness = (cfg.box > 0.5f && cfg.box < 1.5f && on(cfg.popLook)) ? 2.0f : 0.0f;  // pop-up box cards have edges
+                j.spriteWalls = cfg.box > 0.5f && cfg.box < 1.5f && on(cfg.popLook);  // pop-up box cards have edges
                 j.gen = gameGen;
                 worker.hasJob = true;
             }

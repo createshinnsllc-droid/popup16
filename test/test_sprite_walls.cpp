@@ -1,4 +1,4 @@
-// Host-side tests for the sprite card walls in shared/diorama.h (Builder::thickness and Builder::walls).
+// Host-side tests for the sprite card walls in shared/diorama.h (Builder::spriteWalls and Builder::walls).
 // Walls are optional geometry: they must never change the sheets, the quads or the texture.
 //
 // Build and run:  clang++ -std=c++20 -I shared test/test_sprite_walls.cpp -o /tmp/test_sprite_walls_novel-sprite-thickness && /tmp/test_sprite_walls_novel-sprite-thickness
@@ -56,16 +56,16 @@ int main() {
     Scene scene;
     diorama::Input in = makeInput(scene);
 
-    auto flat = std::make_unique<diorama::Builder>();   // thickness 0
-    auto card = std::make_unique<diorama::Builder>();   // thickness 2
-    flat->thickness = 0.0f;
-    card->thickness = 2.0f;
+    auto flat = std::make_unique<diorama::Builder>();   // walls off
+    auto card = std::make_unique<diorama::Builder>();   // walls on
+    flat->spriteWalls = false;
+    card->spriteWalls = true;
     flat->build(in);
     card->build(in);
 
-    check("thickness 0: no walls", flat->walls.empty());
-    check("thickness 2: one left and one right wall", card->walls.size() == 2);
-    check("thickness 2: same quad count as thickness 0", card->quads.size() == flat->quads.size());
+    check("walls off: no walls", flat->walls.empty());
+    check("walls on: one left and one right wall", card->walls.size() == 2);
+    check("walls on: same quad count as walls off", card->quads.size() == flat->quads.size());
 
     bool quadsSame = card->quads.size() == flat->quads.size();
     for (size_t i = 0; quadsSame && i < flat->quads.size(); i++) {
@@ -73,8 +73,8 @@ int main() {
         quadsSame = a.u0 == b.u0 && a.u1 == b.u1 && a.v == b.v && a.disparity == b.disparity && a.slice == b.slice &&
                     a.z == b.z && a.disparity1 == b.disparity1 && a.m7 == b.m7;
     }
-    check("thickness 2: quads identical to thickness 0", quadsSame);
-    check("thickness 2: texture identical to thickness 0", card->tex == flat->tex);
+    check("walls on: quads identical to walls off", quadsSame);
+    check("walls on: texture identical to walls off", card->tex == flat->tex);
 
     // the one sprite span is row 1, columns [2, 4)
     const diorama::Quad *sprite = nullptr;
@@ -87,23 +87,25 @@ int main() {
     if (sprite && card->walls.size() == 2) {
         const diorama::Wall &a = card->walls[0], &b = card->walls[1];
         const diorama::Wall &left = a.u == 2.0f ? a : b, &right = a.u == 2.0f ? b : a;
-        check("left wall sits on the span start (u = 2)", a.u == 2.0f || b.u == 2.0f);
-        check("right wall sits on the span end (u = 4)", a.u == 4.0f || b.u == 4.0f);
+        int lefts = 0, rights = 0;
+        for (const auto &w : card->walls) {
+            lefts += w.u == 2.0f;
+            rights += w.u == 4.0f;
+        }
+        check("walls sit on the span edges: one at u = 2, one at u = 4", lefts == 1 && rights == 1);
         check("walls cover row 1 only (v1 == v0 + 1)", left.v0 == 1.0f && left.v1 == left.v0 + 1.0f &&
                                                        right.v0 == 1.0f && right.v1 == right.v0 + 1.0f);
         check("walls start at the sprite face (dFront == span disparity)",
               left.dFront == sprite->disparity && right.dFront == sprite->disparity);
-        check("walls end 2 SNES px behind the face (dBack == dFront + 2)",
-              left.dBack == left.dFront + 2.0f && right.dBack == right.dFront + 2.0f);
     } else {
+        check("walls sit on the span edges: one at u = 2, one at u = 4", false);
         check("walls cover row 1 only (v1 == v0 + 1)", false);
         check("walls start at the sprite face (dFront == span disparity)", false);
-        check("walls end 2 SNES px behind the face (dBack == dFront + 2)", false);
     }
 
-    card->thickness = 0.0f;
+    card->spriteWalls = false;
     card->build(in);
-    check("rebuild with thickness 0 clears the walls", card->walls.empty());
+    check("rebuild with walls off clears the walls", card->walls.empty());
 
     std::printf("%s\n", failures ? "FAILED" : "all sprite wall tests passed");
     return failures ? 1 : 0;

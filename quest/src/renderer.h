@@ -216,21 +216,26 @@ struct Renderer {
         indexCount = (int)idx.size();
     }
 
+    // Sprite card thickness in metres: the back edge of each wall sits this far behind the sprite face,
+    // in model space (before the placement matrix), so it does not depend on screen width or strength.
+    static constexpr float WALL_THICKNESS_M = 0.004f;
+
     // Box style with pop-up look: each sprite card's edges as one flat dark shape (two triangles per wall).
     // Vertices use the sheet vertex shader's box mapping (screen position, depth from disparity), then the
     // placement matrix, so the walls line up with the sheets. Call once per frame, after shapes.clear().
     void pushWalls(const float screen[4], const float depth[4], const float model[16], const float style[2]) {
         if (walls.empty()) return;
         wallTris.clear();
-        auto put = [&](float u, float v, float dWall) {
+        // dz: offset along model z from the sprite face (0 = front edge, -WALL_THICKNESS_M = back edge)
+        auto put = [&](float u, float v, float dWall, float dz) {
             float d = dWall * depth[1] + depth[2];
-            float p[3] = {(u / frameW - 0.5f) * screen[0], (0.5f - v / frameH) * screen[1], -d * style[1]};
+            float p[3] = {(u / frameW - 0.5f) * screen[0], (0.5f - v / frameH) * screen[1], -d * style[1] + dz};
             for (int r = 0; r < 3; r++) wallTris.push_back(model[r] * p[0] + model[4 + r] * p[1] + model[8 + r] * p[2] + model[12 + r]);
         };
         for (const auto &w : walls) {
             // one quad: front and back edges over rows v0..v1 at column u
-            put(w.u, w.v0, w.dFront); put(w.u, w.v1, w.dFront); put(w.u, w.v0, w.dBack);
-            put(w.u, w.v1, w.dFront); put(w.u, w.v1, w.dBack); put(w.u, w.v0, w.dBack);
+            put(w.u, w.v0, w.dFront, 0.0f); put(w.u, w.v1, w.dFront, 0.0f); put(w.u, w.v0, w.dFront, -WALL_THICKNESS_M);
+            put(w.u, w.v1, w.dFront, 0.0f); put(w.u, w.v1, w.dFront, -WALL_THICKNESS_M); put(w.u, w.v0, w.dFront, -WALL_THICKNESS_M);
         }
         shapes.push_back(FlatShape{wallTris, {0.20f, 0.17f, 0.15f, 1.0f}});  // dark warm card edge
     }

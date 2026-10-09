@@ -28,11 +28,11 @@ struct Quad {
     float m7uv[4][2];    // map texel coords at top-left, top-right, bottom-left, bottom-right
 };
 
-// Card edge of a sprite span (thickness > 0 only): a vertical strip at column u over rows [v0, v1),
-// running from disparity dFront (the sprite face) back to dBack. Drawn as geometry, not in the quads.
+// Card edge of a sprite span (spriteWalls only): a vertical strip at column u over rows [v0, v1), at disparity
+// dFront (the sprite face). Its depth in metres is added by the renderer. Drawn as geometry, not in the quads.
 struct Wall {
     float u, v0, v1;
-    float dFront, dBack;
+    float dFront;
 };
 
 struct Input {
@@ -90,8 +90,8 @@ struct Look {
 struct Builder {
     std::vector<uint32_t> tex;   // SLICES x TEX_H x TEX_W, RGBA bytes (R in the low byte)
     std::vector<Quad> quads;
-    std::vector<Wall> walls;    // sprite card edges, filled only when thickness > 0
-    float thickness = 0.0f;     // SNES pixels a sprite card is thick (0 = flat sheets, no walls)
+    std::vector<Wall> walls;    // sprite card edges, filled only when spriteWalls is set
+    bool spriteWalls = false;   // true: each sprite span gets card-edge walls (quads and texture unchanged)
     bool mode7Ramp = true;
     bool showBackdrop = true;   // false: no backdrop sheet, so the room shows through behind the game
     Look look;
@@ -244,12 +244,12 @@ struct Builder {
                 q.disparity1 = q.disparity;
                 quads.push_back(q);
             }
-        // sprite cards: each span gets a wall on its left and right edge, from its face back by thickness
-        if (thickness > 0.0f)
+        // sprite cards: each span gets a wall on its left and right edge, at the sprite face
+        if (spriteWalls)
             for (const auto &q : quads)
                 if ((int)q.slice == 4) {
-                    walls.push_back({q.u0, q.v, q.v + 1.0f, q.disparity, q.disparity + thickness});
-                    walls.push_back({q.u1, q.v, q.v + 1.0f, q.disparity, q.disparity + thickness});
+                    walls.push_back({q.u0, q.v, q.v + 1.0f, q.disparity});
+                    walls.push_back({q.u1, q.v, q.v + 1.0f, q.disparity});
                 }
         double t2 = nowMs();
         if (frameHasM7) buildMap7(in);
