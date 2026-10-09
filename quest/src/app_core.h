@@ -230,3 +230,17 @@ static bool loadGame(const std::string &name) {
     playedThisLoad = 0;
     return true;
 }
+// The game last_game.txt names (the one quick resume reopens); empty when there is none.
+static std::string lastGameName() {
+    std::vector<uint8_t> a;
+    if (!readFile(filesDir + "/last_game.txt", a)) return "";
+    return std::string(a.begin(), a.end());
+}
+// Quick resume of the game just loaded. Launch and the library both use this, so both tell the same truth.
+static void resumeLoadedGame(const std::string &n) {
+    std::vector<uint8_t> st;
+    bool restored = readFile(saveDir + "/" + stem() + ".resume", st) && !st.empty() && retro_unserialize(st.data(), st.size());
+    if (restored) trace("resumed %s", n.c_str());
+    else { trace("resume state for %s could not be restored; starting from its last save", n.c_str());
+           showToast("Couldn't restore where you left off - started from your last save"); }
+}
