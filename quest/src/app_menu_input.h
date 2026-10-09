@@ -220,6 +220,18 @@ static void menuInput(const bool *b) {
         case P_CLIP: saveClip(); break;
         case P_GAMES: scanRoms(); saveStats(); buildLibView(); menuMode = MENU_ROMS; placeMenu(); break;
         case P_ABOUT: menuMode = MENU_ABOUT; aboutTop = 0; break;
+        case P_DEFAULTS: {  // two presses within 6 s: the first only asks, so a stray press cannot reset anything
+            static double armedUntil = 0;
+            if (nowSec() > armedUntil) {
+                armedUntil = nowSec() + 6;
+                showToast("Press Back to default settings again within 6 s to confirm");
+                break;
+            }
+            armedUntil = 0;
+            resetDisplaySettings();
+            showToast("Settings are back to default");
+            break;
+        }
         case P_PAGE_PICTURE: pausePage = 1; pauseSel = 1; break;
         case P_PAGE_ROOM: pausePage = 2; pauseSel = 1; break;
         case P_BACK: pausePage = 0; pauseSel = 0; break;
