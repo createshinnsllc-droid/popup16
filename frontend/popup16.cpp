@@ -7,6 +7,7 @@
 #include <dlfcn.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <cerrno>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -20,6 +21,7 @@
 #include "../shared/diorama.h"
 #include "../shared/rewind.h"
 #include "../shared/png.h"
+#include "../shared/atomic_file.h"
 
 // ---------- core binding ----------
 struct Core {
@@ -65,10 +67,10 @@ static std::string profilePath, sramPath, statePath;
 
 static void saveProfile() {
     FILE *f = fopen(profilePath.c_str(), "w");
-    if (!f) return;
+    if (!f) { fprintf(stderr, "profile not saved: %s: %s\n", profilePath.c_str(), strerror(errno)); return; }
     fprintf(f, "strength=%g\nconvergence=%g\nhalfSbs=%d\nmode7Ramp=%d\nswapEyes=%d\naspect=%g\n",
             prof.strength, prof.convergence, prof.halfSbs, prof.mode7Ramp, prof.swapEyes, prof.aspect);
-    fclose(f);
+    if (fclose(f) != 0) fprintf(stderr, "profile not saved: %s: %s\n", profilePath.c_str(), strerror(errno));
 }
 static void loadProfile() {
     FILE *f = fopen(profilePath.c_str(), "r");
@@ -218,6 +220,20 @@ static bool writeFile(const std::string &p, const void *d, size_t n) {
     if (!ok) fprintf(stderr, "incomplete write %s\n", p.c_str());
     return ok;
 }
+static void makeDir(const std::string &p) {
+    if (mkdir(p.c_str(), 0755) != 0 && errno != EEXIST) fprintf(stderr, "cannot create %s: %s\n", p.c_str(), strerror(errno));
+}
+// SRAM bytes as of startup or the last successful .srm write. flushSram() rewrites the file only when they differ.
+static std::vector<uint8_t> sramOnDisk;
+static void flushSram() {
+    size_t n = core.get_memory_size(RETRO_MEMORY_SAVE_RAM);
+    const uint8_t *m = (const uint8_t *)core.get_memory_data(RETRO_MEMORY_SAVE_RAM);
+    if (!n || !m) return;
+    if (sramOnDisk.size() == n && memcmp(sramOnDisk.data(), m, n) == 0) return;
+    std::string why;
+    if (!atomicfile::write(sramPath, m, n, &why)) { fprintf(stderr, "SRAM not saved: %s\n", why.c_str()); return; }
+    sramOnDisk.assign(m, m + n);
+}
 static std::string lower(std::string s) { for (auto &c : s) c = (char)tolower(c); return s; }
 static std::string shq(const std::string &s) {
     std::string r = "'";
@@ -271,10 +287,10 @@ int main(int argc, char **argv) {
 
     const char *home = getenv("HOME");
     std::string base = std::string(home ? home : ".") + "/Library/Application Support/PopUp16";
-    mkdir(base.c_str(), 0755);
+    makeDir(base);
     sysDir = base + "/system"; saveDir = base + "/saves";
     std::string profDir = base + "/profiles";
-    mkdir(sysDir.c_str(), 0755); mkdir(saveDir.c_str(), 0755); mkdir(profDir.c_str(), 0755);
+    makeDir(sysDir); makeDir(saveDir); makeDir(profDir);
 
     std::string name = romPath.substr(romPath.find_last_of('/') + 1);
     std::string stem = name.substr(0, name.find_last_of('.'));
@@ -346,6 +362,9 @@ int main(int argc, char **argv) {
         size_t n = core.get_memory_size(RETRO_MEMORY_SAVE_RAM);
         if (n && readFile(sramPath, s) && s.size() == n)
             memcpy(core.get_memory_data(RETRO_MEMORY_SAVE_RAM), s.data(), n);
+        // baseline for flushSram(): a file that did not load is left alone until the game changes SRAM
+        const uint8_t *m = (const uint8_t *)core.get_memory_data(RETRO_MEMORY_SAVE_RAM);
+        if (n && m) sramOnDisk.assign(m, m + n);
     }
     retro_system_av_info av;
     core.get_system_av_info(&av);
@@ -620,6 +639,7 @@ int main(int argc, char **argv) {
 
     bool running = true, ff = false;
     Uint64 lastFrame = SDL_GetPerformanceCounter();
+    Uint64 lastSramFlush = SDL_GetTicks64();
     const double frameSec = 1.0 / av.timing.fps;
     while (running) {
         SDL_Event e;
@@ -649,12 +669,18 @@ int main(int argc, char **argv) {
                 }
                 case SDLK_F5: {
                     std::vector<uint8_t> s(core.serialize_size());
-                    if (core.serialize(s.data(), s.size())) { writeFile(statePath, s.data(), s.size()); msg = "state saved"; }
+                    std::string why;
+                    if (!core.serialize(s.data(), s.size())) { msg = "state not saved"; fprintf(stderr, "state not saved: core serialize failed\n"); }
+                    else if (atomicfile::write(statePath, s.data(), s.size(), &why)) msg = "state saved";
+                    else { msg = "state not saved"; fprintf(stderr, "state not saved: %s\n", why.c_str()); }
                     changed = false; break;
                 }
                 case SDLK_F7: {
                     std::vector<uint8_t> s;
-                    msg = (readFile(statePath, s) && core.unserialize(s.data(), s.size())) ? "state loaded" : "no state";
+                    if (access(statePath.c_str(), F_OK) != 0) msg = "no state";
+                    else if (!readFile(statePath, s)) { msg = "state not loaded"; fprintf(stderr, "state not loaded: cannot read %s\n", statePath.c_str()); }
+                    else if (!core.unserialize(s.data(), s.size())) { msg = "state not loaded"; fprintf(stderr, "state not loaded: core rejected %s\n", statePath.c_str()); }
+                    else msg = "state loaded";
                     changed = false; break;
                 }
                 default: changed = false;
@@ -663,6 +689,7 @@ int main(int argc, char **argv) {
                 updateTitle(win, stem, msg);
             }
         }
+        if (SDL_GetTicks64() - lastSramFlush >= 30000) { flushSram(); lastSramFlush = SDL_GetTicks64(); }
         ff = keys[SDL_SCANCODE_TAB];
 
         // pace emulation by audio queue depth (works on 60/120 Hz displays alike)
@@ -712,10 +739,7 @@ int main(int argc, char **argv) {
         SDL_RenderPresent(ren);
     }
 
-    {
-        size_t n = core.get_memory_size(RETRO_MEMORY_SAVE_RAM);
-        if (n) writeFile(sramPath, core.get_memory_data(RETRO_MEMORY_SAVE_RAM), n);
-    }
+    flushSram();
     saveProfile();
     core.unload_game();
     core.deinit();
